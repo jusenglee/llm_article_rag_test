@@ -1,14 +1,13 @@
 # LLM Article RAG 테스트 프로젝트
 
 ## 개요
-이 저장소는 대규모 논문 데이터셋을 기반으로 검색 증강 생성(RAG) 파이프라인을 구성하고, FastAPI 웹 애플리케이션을 통해 질의 응답을 제공하는 예제 프로젝트입니다. 논문 메타데이터/본문을 Qdrant 또는 Milvus에 적재한 뒤, LLM으로 질의를 확장하고 검색 결과를 재랭킹하여 근거가 포함된 답변을 생성합니다. 또한 연구자 피처 추출 스크립트를 포함하여 데이터 탐색 및 전처리를 지원합니다.
+이 저장소는 대규모 논문 데이터셋을 기반으로 검색 증강 생성(RAG) 파이프라인을 구성하고, FastAPI 웹 애플리케이션을 통해 질의 응답을 제공하는 예제 프로젝트입니다. 논문 메타데이터/본문을 Qdrant에 적재한 뒤, LLM으로 질의를 확장하고 검색 결과를 재랭킹하여 근거가 포함된 답변을 생성합니다. 
 
 ## 디렉터리 구조
 ```
 .
 ├── main.py                # FastAPI 앱 진입점
 ├── query_pipeline.py      # RAG 검색, 프롬프트 구성, Triton 추론 로직
-├── feature_script/        # 논문/연구자 피처 생성 및 통계 스크립트
 ├── qdrant_rag_script/     # 데이터 다운로드 및 벡터 DB 적재 스크립트
 ├── data/                  # 토크나이저 및 샘플 데이터
 └── README.md
@@ -26,29 +25,22 @@
 - **게이트 판단**: 검색 스코어, 질의 패턴, 키워드 품질을 기준으로 RAG 수행 여부를 결정합니다.
 - **컨텍스트 생성**: 검색 결과에서 문서 스니펫과 출처 매핑을 만들어 프롬프트를 구성하며, 토큰 예산을 초과하지 않도록 잘라냅니다.
 
-### 3. 데이터/피처 스크립트 (`feature_script/`)
-- `01_create_aminer_clean_sample.py`: AMiner 논문 JSONL로부터 연구자별 활동 연도, 인용수, 토픽 일관성 등의 피처를 생성합니다.
-- `02_craete_features.py`: 추가로 공저자 네트워크, 임팩트 지표 등을 계산하여 `author_features.jsonl`을 저장합니다.
-- `count_by_data.py`: 생성된 피처의 분포, 결측치, 로그 스케일 인용수 등을 시각화하고 통계를 출력합니다.
-
-### 4. 데이터 적재 스크립트 (`qdrant_rag_script/`)
+### 3. 데이터 적재 스크립트 (`qdrant_rag_script/`)
 - `01_make_dataset.py`: Hugging Face `allenai/peS2o` 데이터셋을 스트리밍으로 내려받아 JSONL 샘플을 생성합니다.
-- `02_ingest_to_qdrant.py`: 논문 본문을 청크로 나누고 HuggingFace 임베딩을 계산하여 Milvus(또는 설정에 따른 백엔드)에 삽입합니다. 재시작 가능한 상태 파일을 이용해 긴 적재 작업을 지원합니다.
+- `02_ingest_to_qdrant.py`: 논문 본문을 청크로 나누고 HuggingFace 임베딩을 계산하여 Qdrant에 삽입합니다. 재시작 가능한 상태 파일을 이용해 긴 적재 작업을 지원합니다.
 
 ## 환경 변수 및 설정
 주요 설정은 환경 변수로 제어합니다. 필요 시 `.env` 파일을 만들어 FastAPI 또는 스크립트 실행 전에 로드하세요.
 
 | 이름 | 기본값 | 설명 |
 | --- | --- | --- |
-| `QDRANT_HOST` | `211.241.177.73` | Qdrant gRPC 호스트 |
-| `QDRANT_URL` | `http://211.241.177.73:6333` | Qdrant HTTP URL |
+| `QDRANT_HOST` | `localhost` | Qdrant gRPC 호스트 |
+| `QDRANT_URL` | `localhost:6333` | Qdrant HTTP URL |
 | `QDRANT_COLLECTION` | `peS2o_rag` | 검색에 사용할 컬렉션 이름 |
 | `EMBEDDING_MODEL` | `BAAI/bge-m3` | LlamaIndex 임베딩 모델 |
-| `TRITON_URL` | `211.241.177.73:8001` | Triton Inference Server 주소 |
+| `TRITON_URL` | `localhost:8001` | Triton Inference Server 주소 |
 | `TRITON_MODEL` | `gemma_vllm_0` | Triton 상의 모델 이름 |
 | `TOKENIZER_ID` | `./` | 토크나이저 경로 또는 ID |
-| `MILVUS_HOST` | `localhost` | (Milvus 적재 시) 호스트 |
-| `MILVUS_PORT` | `19530` | (Milvus 적재 시) 포트 |
 | `MILVUS_COLLECTION` | `peS2o_rag` | (Milvus 적재 시) 컬렉션 이름 |
 
 ## 설치 및 실행
@@ -79,15 +71,8 @@
    # Hugging Face 데이터셋 샘플링
    python qdrant_rag_script/01_make_dataset.py
 
-   # Milvus/Qdrant로 청크 적재
+   # Qdrant로 청크 적재
    python qdrant_rag_script/02_ingest_to_qdrant.py
-   ```
-
-6. **연구자 피처 생성 (선택)**
-   ```bash
-   python feature_script/01_create_aminer_clean_sample.py
-   python feature_script/02_craete_features.py
-   python feature_script/count_by_data.py
    ```
 
 ## 개발 참고 사항
