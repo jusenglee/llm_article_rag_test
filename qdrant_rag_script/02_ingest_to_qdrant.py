@@ -1,196 +1,205 @@
-import os
-import uuid
+import os, json, math, hashlib, time, threading, uuid
 from pathlib import Path
+from typing import List, Dict, Any, Tuple
 import orjson
-from typing import Iterator, Dict, Any, List
+import numpy as np
 from tqdm import tqdm
-from pymilvus import (
-    connections,
-    FieldSchema, CollectionSchema, DataType, Collection, utility
-)
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import VectorParams, Distance, PointStruct
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core import Document
 from llama_index.core.node_parser import SentenceSplitter
 
 # ---------------------------
 # 설정
 # ---------------------------
-MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
-MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
-COLLECTION = os.getenv("MILVUS_COLLECTION", "peS2o_rag")
-EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")  # ← 로컬 테스트 기본값
+QDRANT_PORT = int(os.getenv("QDRANT_HTTP_PORT", "6333"))
+QDRANT_URL  = f"http://{QDRANT_HOST}:{QDRANT_PORT}"
+COLLECTION  = os.getenv("QDRANT_COLLECTION", "peS2o_rag")
 
-JSON_PATH = Path("../data/peS2o_sample.jsonl")
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 120
-BATCH_SIZE = 256
-RESUME_STATE = Path(".ingest_resume_peS2o.txt")
+EMBED_MODEL    = os.getenv("EMBED_MODEL", "BAAI/bge-m3")  # 1024-d dense
+CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP  = int(os.getenv("CHUNK_OVERLAP", "120"))
+BATCH_SIZE     = int(os.getenv("BATCH_SIZE", "512"))
+JSON_PATH      = Path(os.getenv("JSON_PATH", "peS2o_sample.jsonl"))
+RESUME_FILE    = Path(os.getenv("RESUME_FILE", ".ingest_resume_dualgpu.state"))
+VECTOR_DIM     = int(os.getenv("VECTOR_DIM", "1024"))
+DISTANCE_ENUM  = Distance.COSINE          # ← 문자열 아님! Enum 사용
+USE_CACHE      = os.getenv("USE_CACHE", "1") == "1"
+
+# 컬렉션이 이미 있고 데이터가 있는데 재생성 방지
+ALLOW_RECREATE = os.getenv("ALLOW_RECREATE", "0") == "1"
 
 # ---------------------------
 # 유틸
 # ---------------------------
-def iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                yield orjson.loads(line)
+def make_point_id(paper_id: str, chunk_idx: int, text: str) -> str:
+    base = f"{paper_id}_{chunk_idx}_{text[:50]}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, base))
 
-def load_resume_offset() -> int:
-    if RESUME_STATE.exists():
+def iter_jsonl(path: Path, start_idx: int = 0):
+    with path.open("r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i < start_idx: continue
+            s = line.strip()
+            if not s: continue
+            yield i, orjson.loads(s)
+
+def save_resume(n: int):
+    RESUME_FILE.write_text(str(n))
+
+def load_resume() -> int:
+    if RESUME_FILE.exists():
         try:
-            return int(RESUME_STATE.read_text().strip())
-        except Exception:
+            return int(RESUME_FILE.read_text().strip())
+        except:
             return 0
     return 0
 
-def save_resume_offset(n: int) -> None:
-    RESUME_STATE.write_text(str(n))
+# ---------------------------
+# Qdrant
+# ---------------------------
+def ensure_collection(client: QdrantClient):
+    exists = False
+    try:
+        info = client.get_collection(COLLECTION)
+        exists = True
+        params = info.config.params
+        # distance/size 불일치 시 경고
+        if params.vectors.size != VECTOR_DIM or str(params.vectors.distance).lower().find("cosine") == -1:
+            msg = (f"⚠️ 컬렉션 정의 불일치: size={params.vectors.size}, "
+                   f"distance={params.vectors.distance} (필요 size={VECTOR_DIM}, distance=Cosine)")
+            print(msg)
+            if not ALLOW_RECREATE:
+                raise RuntimeError(msg + "  (ALLOW_RECREATE=1 환경변수로 재생성 허용 가능)")
+            print("♻️  재생성 진행 (데이터 삭제됨) ...")
+            client.recreate_collection(
+                collection_name=COLLECTION,
+                vectors_config=VectorParams(size=VECTOR_DIM, distance=DISTANCE_ENUM),
+            )
+            # 재시작이므로 resume 파일도 초기화 권장
+            if RESUME_FILE.exists():
+                RESUME_FILE.unlink(missing_ok=True)
+            print(f"✅ Collection recreated: {COLLECTION} (Cosine/{VECTOR_DIM})")
+        else:
+            print(f"✅ Found collection: {COLLECTION} (Cosine/{VECTOR_DIM})")
+    except Exception as e:
+        if not exists:
+            print(f"ℹ️ 컬렉션 미존재 → 생성: {COLLECTION}")
+            client.recreate_collection(
+                collection_name=COLLECTION,
+                vectors_config=VectorParams(size=VECTOR_DIM, distance=DISTANCE_ENUM),
+            )
+            print(f"✅ Created collection: {COLLECTION} (Cosine/{VECTOR_DIM})")
+        else:
+            raise
 
-def to_chunks(rec: Dict[str, Any], splitter: SentenceSplitter) -> List[Document]:
-    # 1) 최우선: text 필드
-    text = (rec.get("text") or "").strip()
+# ---------------------------
+# Dual GPU Embedding (정규화 포함)
+# ---------------------------
+class DualGPUEmbedder:
+    def __init__(self, model_name: str, batch_size: int = 256):
+        # 단일 GPU 환경에서도 동작하도록 가드
+        self.models = []
+        try:
+            self.models.append(HuggingFaceEmbedding(model_name=model_name, device="cuda:0", embed_batch_size=batch_size))
+            # 두 번째 GPU가 없으면 except로 넘어감
+            self.models.append(HuggingFaceEmbedding(model_name=model_name, device="cuda:1", embed_batch_size=batch_size))
+        except Exception:
+            # fallback: 단일 GPU 또는 CPU
+            if not self.models:
+                self.models.append(HuggingFaceEmbedding(model_name=model_name, device="cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu", embed_batch_size=batch_size))
 
-    # 2) 대안 경로: title/abstract/sections/body_text에서 합성
-    if not text:
-        title = (rec.get("title") or "").strip()
-        abstract = (rec.get("abstract") or rec.get("paperAbstract") or "").strip()
+        self.cache = {} if USE_CACHE else None
 
-        # sections: [{heading, text}] 또는 [{section/section_title, text}] 가정
-        sections_txt = []
-        secs = rec.get("sections") or rec.get("body_text") or rec.get("pdf_parse", {}).get("body_text") or []
-        if isinstance(secs, list):
-            for s in secs[:50]:  # 과도한 본문 방지
-                if isinstance(s, dict):
-                    st = (s.get("text") or "").strip()
-                    if st:
-                        sections_txt.append(st)
+    def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        if len(self.models) == 1:
+            vecs = self.models[0].get_text_embedding_batch(texts)
+        else:
+            mid = len(texts) // 2
+            parts = [texts[:mid], texts[mid:]]
+            res = [None, None]
 
-        # body 후보 (일부 데이터셋은 'body'나 'content' 등으로 있을 수 있음)
-        body = (rec.get("body") or rec.get("content") or "").strip()
+            def run(idx: int):
+                if parts[idx]:
+                    res[idx] = self.models[idx].get_text_embedding_batch(parts[idx])
 
-        parts = [title, abstract] + sections_txt + ([body] if body else [])
-        text = "\n\n".join([p for p in parts if p])
+            t1 = threading.Thread(target=run, args=(0,))
+            t2 = threading.Thread(target=run, args=(1,))
+            t1.start(); t2.start()
+            t1.join(); t2.join()
 
-    if not text:
-        return []  # 여전히 비면 스킵
+            vecs = []
+            for r in res:
+                if r: vecs.extend(r)
 
-    paper_id = rec.get("id") or rec.get("paper_id") or rec.get("uid") or ""
-    source = rec.get("source", "peS2o")
+        # 🔒 Cosine 일관성 확보를 위해 항상 단위벡터화
+        arr = np.asarray(vecs, dtype=np.float32)
+        arr /= np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
+        return arr.tolist()
 
-    docs: List[Document] = []
-    for chunk in splitter.split_text(text):
-        docs.append(Document(text=chunk, metadata={"paper_id": str(paper_id), "source": source}))
-    return docs
-
+# ---------------------------
+# 업서트
+# ---------------------------
+def upsert_batch(client: QdrantClient, ids: List[str], vectors: List[List[float]], payloads: List[Dict[str, Any]]):
+    points = [PointStruct(id=ids[i], vector=vectors[i], payload=payloads[i]) for i in range(len(ids))]
+    client.upsert(collection_name=COLLECTION, points=points)
 
 # ---------------------------
 # 메인
 # ---------------------------
 def main():
-    assert JSON_PATH.exists(), f"입력 파일 없음: {JSON_PATH}"
+    # HTTP 모드(안정)로 연결
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    ensure_collection(client)
 
-    # Milvus 연결
-    connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
-    print(f"✅ Connected to Milvus at {MILVUS_HOST}:{MILVUS_PORT}")
+    # 재생성했으면 resume 초기화 권장
+    start_line = load_resume()
+    print(f"↩️ Resume from line {start_line}")
 
-    # 컬렉션 존재 확인 / 생성
-    if not utility.has_collection(COLLECTION):
-        print(f"🆕 Creating new collection: {COLLECTION}")
-
-        fields = [
-            FieldSchema(name="id", dtype=DataType.VARCHAR, is_primary=True, max_length=64),
-            FieldSchema(name="paper_id", dtype=DataType.VARCHAR, max_length=32),
-            FieldSchema(name="source", dtype=DataType.VARCHAR, max_length=32),
-            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
-            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1024),
-        ]
-        schema = CollectionSchema(fields, description="RAG embeddings for peS2o papers")
-        collection = Collection(name=COLLECTION, schema=schema)
-
-        collection.create_index(
-            field_name="embedding",
-            index_params={
-                "index_type": "HNSW",
-                "metric_type": "COSINE",
-                "params": {"M": 16, "efConstruction": 200},
-            },
-        )
-        print("✅ Index created.")
-    else:
-        print(f"✅ Found collection: {COLLECTION}")
-        collection = Collection(name=COLLECTION)
-
-    collection.load()
-
-    # 임베딩 모델
-    embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL, device="cuda")
     splitter = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    embedder = DualGPUEmbedder(EMBED_MODEL, batch_size=256)
 
-    # 재시작 오프셋
-    start_idx = load_resume_offset()
-    print(f"↩️  Resume from line index: {start_idx}")
-
-    batch_ids, batch_paper_ids, batch_sources, batch_texts, batch_embeddings = [], [], [], [], []
     total_chunks = 0
+    ids, payloads, texts = [], [], []
 
-    try:
-        total_lines = sum(1 for _ in JSON_PATH.open("r", encoding="utf-8"))
-    except Exception:
-        total_lines = None
+    total_lines = sum(1 for _ in open(JSON_PATH, "r", encoding="utf-8"))
+    pbar = tqdm(total=total_lines, desc="Ingesting", ncols=100)
 
-    with tqdm(total=total_lines, desc="Ingesting", unit="line", disable=(total_lines is None)) as pbar:
-        for i, rec in enumerate(iter_jsonl(JSON_PATH)):
-            if i < start_idx:
-                if total_lines:
-                    pbar.update(1)
-                continue
+    for i, rec in iter_jsonl(JSON_PATH, start_line):
+        # 다양한 스키마 대응
+        raw_text = (rec.get("text") or rec.get("_node_text") or "").strip()
+        if not raw_text:
+            pbar.update(1)
+            continue
 
-            print(f"[DEBUG] line={i}  keys={list(rec.keys())[:10]}")  # ① JSON 구조
-            docs = to_chunks(rec, splitter)
-            print(f"[DEBUG] chunks={len(docs)}")                     # ② 청크 수
+        paper_id = str(rec.get("paper_id") or rec.get("id") or rec.get("doc_id") or "unknown")
+        source   = rec.get("source", "peS2o")
 
-            for doc in docs:
-                emb = embed_model.get_text_embedding(doc.text)
-                uid = f"{rec.get('id') or rec.get('paper_id') or ''}_{uuid.uuid4().hex}"
-                batch_ids.append(uid)
-                batch_paper_ids.append(str(rec.get("id") or rec.get("paper_id") or ""))
-                batch_sources.append(rec.get("source", "peS2o"))
-                batch_texts.append(doc.text)
-                batch_embeddings.append(emb)
+        chunks = splitter.split_text(raw_text)
+        for ci, chunk in enumerate(chunks):
+            pid = make_point_id(paper_id, ci, chunk)
+            ids.append(pid)
+            payloads.append({"paper_id": paper_id, "source": source, "_node_text": chunk})
+            texts.append(chunk)
 
-            if len(batch_ids) >= BATCH_SIZE:
-                print(f"[DEBUG] insert batch: {len(batch_ids)}")
-                data = [
-                    batch_ids,
-                    batch_paper_ids,
-                    batch_sources,
-                    batch_texts,
-                    batch_embeddings,
-                ]
-                collection.insert(data)
-                total_chunks += len(batch_ids)
-                batch_ids, batch_paper_ids, batch_sources, batch_texts, batch_embeddings = [], [], [], [], []
-                save_resume_offset(i + 1)
+        # 배치 임계 시 처리
+        if len(texts) >= BATCH_SIZE:
+            vecs = embedder.embed_batch(texts)
+            upsert_batch(client, ids, vecs, payloads)
+            total_chunks += len(texts)
+            ids.clear(); payloads.clear(); texts.clear()
+            save_resume(i + 1)
+        pbar.update(1)
 
-            if total_lines:
-                pbar.update(1)
+    # 잔여 처리
+    if texts:
+        vecs = embedder.embed_batch(texts)
+        upsert_batch(client, ids, vecs, payloads)
+        total_chunks += len(texts)
+        save_resume(i + 1)
 
-        # 잔여 처리
-        if batch_ids:
-            data = [
-                batch_ids,
-                batch_paper_ids,
-                batch_sources,
-                batch_texts,
-                batch_embeddings,
-            ]
-            collection.insert(data)
-            total_chunks += len(batch_ids)
-            save_resume_offset(i + 1)
-
-    collection.flush()
-    print(f"✅ Done. Indexed chunks: {total_chunks}")
-    print(f"🔎 Collection: {COLLECTION} @ {MILVUS_HOST}:{MILVUS_PORT}")
+    print(f"✅ Done. Total {total_chunks} chunks ingested.")
 
 if __name__ == "__main__":
     main()
