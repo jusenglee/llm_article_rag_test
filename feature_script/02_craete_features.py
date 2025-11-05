@@ -5,7 +5,7 @@ import networkx as nx
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
-INPUT_FILE = "../data/aminer_clean_sample_10000.jsonl"
+INPUT_FILE = "../data/aminer_clean_sample_100000.jsonl"
 
 # ---------------------------
 # 데이터 로드 및 연도별 분류
