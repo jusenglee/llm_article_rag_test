@@ -27,7 +27,7 @@ COLLECTION   = os.getenv("QDRANT_COLLECTION", "peS2o_rag")
 EMBED_MODEL  = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")  # 1024-d
 TRITON_URL   = os.getenv("TRITON_URL", "211.241.177.73:8001")
 MODEL_NAME   = os.getenv("TRITON_MODEL", "gemma_vllm_0")
-TOKENIZER_ID = os.getenv("TOKENIZER_ID", "./")
+TOKENIZER_ID = os.getenv("TOKENIZER_ID", "./data/")
 
 TOP_K_BASE = 20
 TOP_K_RETURN = 20
