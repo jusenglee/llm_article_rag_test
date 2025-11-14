@@ -49,70 +49,6 @@ async def init_rag():
 async def home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
-@app.post("/query")
-async def query_rag(request: Request, question: str = Form(...)):
-    logs = []
-    t0 = time.time()
-
-    def log(msg):
-        logger.info(msg); logs.append(msg)
-
-    try:
-        log(f"\n질문 > {question}")
-
-        # --- 게이트 판단 ---
-        t1 = time.time()
-        need_rag = decide_rag_needed(question)  # 동기(비스트림)
-        t2 = time.time()
-
-        log(f"🧭 LLM 판단 결과: {'RAG 검색 수행' if need_rag else '일반 대화'}  "
-            f"(gate={t2 - t1:.2f}s)")
-
-        # --- 확장/검색 ---
-        expanded_text, kw_list = expand_query_kor(question)
-        keywords = expand_variants(kw_list)
-        log(f"🔑 확장 키워드: {keywords}")
-
-        t3 = time.time()
-        hits = dense_retrieve_hybrid(qdr, emb, expanded_text, keywords)
-        t4 = time.time()
-        log(f"🔍 검색된 문서 수(max 20): {len(hits)}  (search={t4 - t3:.2f}s)")
-
-        ok, gate_msg = rag_gate_decision(question, hits, kw_list, need_rag)
-        log(gate_msg)
-
-        # --- 일반 대화 ---
-        if not ok:
-            prompt = build_chat_prompt(question)
-            t5 = time.time()
-            full = triton_infer(prompt, stream=False)  # 문자열(비스트림)
-            t6 = time.time()
-            log(f"⚡ LLM: {t6 - t5:.2f}s")
-            log("\n📘 답변:\n" + full.strip() + "\n" + "-"*80)
-            return JSONResponse({"mode": "chat", "answer": full.strip(), "logs": logs})
-
-        # --- RAG ---
-        log("✅ 게이트 판단 결과: RAG 검색/응답 수행")
-        boost_map = keyword_boost(hits, kw_list)
-        reranked = rrf_rerank(hits, boost_map)
-        final_hits = dedup_by_doc(reranked)
-        ctx, refs = build_context_and_refs(final_hits)
-        ctx = trim_context_to_budget(ctx)
-        log(f"🔎 Retrieved top-{len(final_hits)} (after RRF+dedup).")
-
-        rag_prompt = build_rag_prompt(ctx, question, refs)
-        t7 = time.time()
-        full = triton_infer(rag_prompt, stream=False)  # 문자열(비스트림)
-        t8 = time.time()
-        log(f"⚡ LLM: {t8 - t7:.2f}s")
-        log("\n📘 답변:\n" + full.strip() + "\n" + "-"*80)
-
-        return JSONResponse({"mode": "rag", "answer": full.strip(), "refs": refs, "logs": logs})
-
-    except Exception as e:
-        traceback.print_exc()
-        return JSONResponse({"error": str(e)}, status_code=500)
-
 # ---------------------------
 # SSE STREAM
 # ---------------------------
@@ -121,7 +57,9 @@ async def query_stream(question: str):
 
     async def event_gen():
         try:
+            import asyncio
             yield "data: [STEP 0] 질문 수신\n\n"
+            await asyncio.sleep(0)  # 첫 flush
 
             # STEP 1: 게이트 판단
             t0 = time.time()
@@ -130,32 +68,20 @@ async def query_stream(question: str):
             yield f"data: [STEP 1] 게이트={need_rag} (t={t1 - t0:.2f}s)\n\n"
 
             # ---------------------------------------------------------
-            # ★ 게이트=False → RAG 전체 스킵 (최적화 핵심)
+            # ★ 게이트=False → RAG 전체 스킵 (일반 대화만)
             # ---------------------------------------------------------
             if not need_rag:
                 yield "data: [STEP 2] RAG 스킵 → 일반 대화 진행\n\n"
                 prompt = build_chat_prompt(question)
 
                 yield "data: [STEP 3] LLM 스트리밍 시작 (chat)\n\n"
-                full_bytes = bytearray()
+
+                # 토큰 단위로만 보내고, decoded 따로 안 보냄
                 for chunk in triton_infer(prompt, stream=True):
-                    if not chunk:
-                        continue
-
-                    # chunk 자체가 bytes임 → 통째로 저장
-                    if isinstance(chunk, bytes):
-                        full_bytes.extend(chunk)
-                    else:
-                        full_bytes.extend(chunk.encode("utf-8"))
-
-                    # 중간에는 placeholder 출력 (원하면)
+                    if chunk == "" or chunk is None:
+                        yield "data: [END]\n\n"
+                        return
                     yield f"data: {chunk}\n\n"
-
-                # 최종 디코딩
-                decoded = tokenizer.decode(list(full_bytes))
-
-                yield f"data: {decoded}\n\n"
-                yield "data: [END]\n\n"
 
             # ---------------------------------------------------------
             # ★ need_rag == True → RAG 파이프라인 전체 수행

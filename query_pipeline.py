@@ -32,7 +32,7 @@ TOKENIZER_ID = os.getenv("TOKENIZER_ID", "./data/")
 
 TOP_K_BASE = 20
 TOP_K_RETURN = 20
-MAX_TOKENS    = 512
+MAX_TOKENS    = 1024
 TEMPERATURE   = 0.6
 TOP_P         = 0.9
 
@@ -58,54 +58,161 @@ except Exception:
 # Triton LLM (Streaming / Sync 겸용)
 # ---------------------------
 
-def _make_inputs(prompt: str, *, max_tokens: int, stop: List[str] | None, temperature: float, top_p: float):
+def _make_inputs(
+        prompt: str,
+        *,
+        max_tokens: int,
+        stop: List[str] | None,
+        temperature: float,
+        top_p: float,
+        stream: bool,
+):
     text = InferInput("text_input", [1], "BYTES")
-    text.set_data_from_numpy(np.array([prompt.encode("utf-8")], dtype=object))
+    text.set_data_from_numpy(
+        np.array([prompt.encode("utf-8")], dtype=object)
+    )
 
-    sparams = InferInput("sampling_parameters", [1], "BYTES")
+    sparams = InferInput("parameters", [1], "BYTES")
     params = {
         "temperature": float(temperature),
         "top_p": float(top_p),
         "max_tokens": int(max_tokens),
+        "stream": bool(stream),  # ← 여기에서만 stream 여부 제어
     }
     if stop:
         params["stop"] = list(stop)
-    sparams.set_data_from_numpy(np.array([json.dumps(params).encode("utf-8")], dtype=object))
+
+    sparams.set_data_from_numpy(
+        np.array([json.dumps(params).encode("utf-8")], dtype=object)
+    )
 
     return text, sparams
 
+def stream_with_eos_detection(gen, eos="<eos>"):
+    buffer = ""
+    for chunk in gen:
+        if not isinstance(chunk, str):
+            chunk = chunk.decode("utf-8", errors="ignore")
+
+        buffer += chunk
+
+        yield chunk
+
+        # EOS 토큰이 보이는 순간 종료
+        if eos in buffer:
+            break
+
+def triton_infer(
+        prompt: str,
+        *,
+        stream: bool = True,
+        max_tokens: int = MAX_TOKENS,
+        stop: List[str] | None = None,
+        temperature: float = TEMPERATURE,
+        top_p: float = TOP_P,
+        timeout_first: int = 20,
+        timeout_idle: int = 5,
+):
+    """
+    stream=True  → 제너레이터를 반환 (chunk 단위 텍스트)
+    stream=False → 전체 응답을 하나의 문자열로 반환
+    """
+    logger.info(
+        f"\n[DEBUG] 🚀 triton_infer 호출 - stream={stream}, "
+        f"max_tokens={max_tokens}, len={len(prompt)}"
+    )
+
+    if stream:
+        text, sparams = _make_inputs(
+            prompt,
+            max_tokens=max_tokens,
+            stop=stop,
+            temperature=temperature,
+            top_p=top_p,
+            stream=True,
+        )
+        return _triton_stream_generator(
+            prompt,
+            text,
+            sparams,
+            first_token_timeout=timeout_first,
+            idle_timeout=timeout_idle,
+        )
+
+    # sync path
+    return _triton_infer_sync(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        stop=stop,
+    )
+
 
 def _triton_stream_generator(
-        prompt,
-        text,
-        sparams,
-        first_token_timeout=20,   # 첫 토큰까지 최대 20초
-        idle_timeout=5,           # 토큰 사이 idle 은 5초
+        prompt: str,
+        text: InferInput,
+        sparams: InferInput,
+        first_token_timeout: int = 20,
+        idle_timeout: int = 5,
 ):
     cli = InferenceServerClient(url=TRITON_URL, verbose=False)
 
     stream_flag = InferInput("stream", [1], "BOOL")
     stream_flag.set_data_from_numpy(np.array([True], dtype=bool))
+
     outs = [InferRequestedOutput("text_output")]
 
     q, done = [], threading.Event()
 
     def on_resp(result, error):
-        if result is None:
-            done.set()
-            return
-        if error:
+        if error is not None:
             logger.info(f"[ERR] Triton 오류: {error}")
             done.set()
             return
+
+        if result is None:
+            logger.info("[RAW] result=None (스트림 종료 신호 가능)")
+            done.set()
+            return
+
         arr = result.as_numpy("text_output")
-        if arr is not None and len(arr) > 0:
-            txt = arr[0].decode("utf-8")
-            if txt:
-                q.append(txt)
+
+        if arr is None or len(arr) == 0:
+            logger.info("[RAW] arr is None or empty → EOS 처리")
+            done.set()
+            return
+
+        raw_bytes = arr[0]
+        logger.info(f"[RAW BYTES] {raw_bytes!r}")
+
+        # 🔚 여기서 backend가 보내는 빈 chunk(b'' / '')를 EOS로 취급
+        if raw_bytes is None or raw_bytes == b"" or raw_bytes == "":
+            logger.info("[RAW] empty chunk → EOS 처리")
+            done.set()
+            return
+
+        try:
+            txt = raw_bytes.decode("utf-8", errors="ignore")
+        except Exception:
+            txt = str(raw_bytes)
+
+        logger.info(f"[RAW TEXT] {txt!r}")
+
+        # decode 후에도 비어 있으면 EOS로 취급
+        if txt == "":
+            logger.info("[RAW] empty text → EOS 처리")
+            done.set()
+            return
+
+        q.append(txt)
 
     cli.start_stream(callback=on_resp)
-    cli.async_stream_infer(MODEL_NAME, inputs=[text, sparams, stream_flag], outputs=outs)
+    cli.async_stream_infer(
+        MODEL_NAME,
+        inputs=[text, sparams, stream_flag],
+        outputs=outs,
+    )
 
     try:
         start = time.time()
@@ -120,11 +227,10 @@ def _triton_stream_generator(
                 yield chunk
             else:
                 now = time.time()
-                # 첫 토큰 기다리는 중
                 if not got_first and now - start > first_token_timeout:
                     logger.info("[WARN] first token timeout")
                     break
-                # 첫 토큰 이후 idle
+                # ✅ 정상 스트림이면 EOS에서 done이 올라가서 여기 안 걸릴 것.
                 if got_first and now - last > idle_timeout:
                     logger.info("[WARN] idle timeout after first token")
                     break
@@ -132,44 +238,40 @@ def _triton_stream_generator(
     finally:
         cli.stop_stream()
 
-
-def triton_infer(
+def _triton_infer_sync(
         prompt: str,
         *,
-        stream: bool = True,
-        max_tokens: int = MAX_TOKENS,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
         stop: List[str] | None = None,
-        temperature: float = TEMPERATURE,
-        top_p: float = TOP_P,
-        timeout_first=20, timeout_idle=5
-):
-    """decoupled 모델 호환: stream=True만 사용하고, sync는 스트림을 모아 문자열 반환."""
-    logger.info(f"\n[DEBUG] 🚀 triton_infer 호출 - stream={stream}, max_tokens={max_tokens}, len={len(prompt)}")
-
+) -> str:
+    """
+    decoupled 모델용 sync 모드:
+    내부적으로는 streaming RPC를 쓰고, 토큰을 모아서 하나의 문자열로 반환.
+    """
+    # sync에서도 어차피 decoupled → streaming RPC만 가능
     text, sparams = _make_inputs(
         prompt,
         max_tokens=max_tokens,
         stop=stop,
         temperature=temperature,
         top_p=top_p,
+        stream=True,   # ← 여기 중요: backend는 stream 모드로 동작
     )
 
-    gen = _triton_stream_generator(
-        prompt,
-        text,
-        sparams,
-        first_token_timeout=timeout_first,
-        idle_timeout=timeout_idle,
-    )
-    if stream:
-        # ❗여기서 절대 yield / yield from 쓰지 말 것
-        return gen                 # 제너레이터 '객체'를 반환 (함수 자체는 일반 함수)
-    else:
-        # pseudo-sync: 스트림 결과 모아서 문자열 반환
-        return "".join(list(gen))
+    chunks: list[str] = []
+    for chunk in _triton_stream_generator(
+            prompt,
+            text,
+            sparams,
+            first_token_timeout=30,
+            idle_timeout=5,
+    ):
+        # chunk는 이미 str
+        chunks.append(chunk)
 
-
-
+    return "".join(chunks)
 # ---------------------------
 # RAG 빌드
 # ---------------------------
@@ -193,6 +295,7 @@ def build_rag_objects():
 # ---------------------------
 
 def dynamic_expand_query_llm(query: str) -> List[str]:
+    logger.info("[info] 질의 확장 시작")
     prompt = f"""
 You are a scientific keyword generator for academic search.
 Respond ONLY with a JSON array of 8 concise English keywords.
@@ -250,6 +353,7 @@ def _safe_query_embedding(emb, text: str):
 
 
 def dense_retrieve_hybrid(client: QdrantClient, emb, expanded_text: str, keywords: List[str], top_k=TOP_K_BASE):
+    logger.info("[info] 벡터 DB 검색 시작")
     q_vec = _safe_query_embedding(emb, expanded_text)
     hits = client.query_points(
         collection_name=COLLECTION,
@@ -258,6 +362,7 @@ def dense_retrieve_hybrid(client: QdrantClient, emb, expanded_text: str, keyword
         with_payload=True,
         timeout=3  # 1초 제한
     ).points
+    logger.info(hits)
     return hits
 
 
@@ -432,6 +537,7 @@ def trim_context_to_budget(ctx: str, budget=CTX_TOKEN_BUDGET) -> str:
 
 
 def build_rag_prompt(context_text, query, refs):
+    logger.info("[info] build_rag_prompt 시작")
     if refs:
         ref_lines = "\n".join([f"[{n}] {title} (ID={pid})" for n, title, pid in refs])
     else:
@@ -462,7 +568,7 @@ def build_rag_prompt(context_text, query, refs):
         ]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception:
-        return f"<|system|>\n{system_msg}\n</s>\n<|user|>\n{user_msg}\n</s>\n<|assistant|>\n"
+        return f"<|system|>\n{system_msg}\n<eos>\n<|user|>\n{user_msg}\n<eos>\n<|assistant|>\n"
 
 
 def build_chat_prompt(query: str) -> str:
@@ -474,7 +580,7 @@ def build_chat_prompt(query: str) -> str:
         ]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception:
-        return f"<|system|>\n{sys}\n</s>\n<|user|>\n{query}\n</s>\n<|assistant|>\n"
+        return f"<|system|>\n{sys}\n<eos>\n<|user|>\n{query}\n<eos>\n<|assistant|>\n"
 
 
 # ---------------------------
@@ -508,6 +614,7 @@ def _ensure_text(x):
     return str(x)
 
 def decide_rag_needed(query: str) -> bool:
+    logger.info("[info] LLM의 RAG or Chat 판단 시작")
     prompt = (
         "Classify the query.\n"
         "Return only ONE word: RAG or CHAT.\n\n"
@@ -579,7 +686,8 @@ def main():
         if not ok:
             prompt = build_chat_prompt(query)
             logger.info("\n📘 답변:")
-            for chunk in triton_infer(prompt, stream=True, max_tokens=MAX_TOKENS):
+            gen = triton_infer(prompt, stream=True, max_tokens=MAX_TOKENS)
+            for chunk in stream_with_eos_detection(gen, eos=tokenizer.eos_token):
                 logger.info(chunk.rstrip("\n"))
             logger.info("\n" + "-" * 80)
             continue
@@ -592,7 +700,8 @@ def main():
 
         prompt = build_rag_prompt(ctx, query, refs)
         logger.info("\n📚 RAG 답변:")
-        for chunk in triton_infer(prompt, stream=True, max_tokens=MAX_TOKENS):
+        gen = triton_infer(prompt, stream=True, max_tokens=MAX_TOKENS)
+        for chunk in stream_with_eos_detection(gen, eos=tokenizer.eos_token):
             logger.info(chunk.rstrip("\n"))
         logger.info("\n참고문헌:", ", ".join([f"[{n}] {title}" for n, title, _ in refs]))
         logger.info("\n" + "-" * 80)
