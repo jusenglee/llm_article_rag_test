@@ -42,8 +42,8 @@ TOKENIZER_ID = os.getenv("TOKENIZER_ID", "./data/") # 로컬 경로 혹은 모�
 
 # 하이퍼파라미터
 TOP_K_BASE = 20        # 검색 후보군 (넉넉하게 잡음)
-TOP_K_RETURN = 3       # 최종 반환 개수
-MAX_TOKENS    = 4096
+TOP_K_RETURN = 20       # 최종 반환 개수
+MAX_TOKENS    = 8192
 TEMPERATURE   = 0.6
 TOP_P         = 0.9
 
