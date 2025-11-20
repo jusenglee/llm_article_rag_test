@@ -2,88 +2,350 @@
 <html lang="ko">
 <head>
   <meta charset="UTF-8">
-  <title>RAG Query Web</title>
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <title>RAG Dual Stack Query Web</title>
   <style>
-    body { font-family: 'Segoe UI', Pretendard, sans-serif; background: #f6f8fa; color: #222; margin: 0;
-      display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
-    h2 { margin-top: 60px; color: #1e88e5; font-weight: 700; }
+    body {
+      font-family: 'Segoe UI', Pretendard, sans-serif;
+      background: #f6f8fa;
+      color: #222;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+    }
+    h2 {
+      margin-top: 40px;
+      color: #1e88e5;
+      font-weight: 700;
+    }
 
     form {
-      background: #fff; box-shadow: 0 2px 10px rgba(0,0,0,0.08);
-      border-radius: 12px; padding: 20px;
-      width: 90%; max-width: 700px;
-      display: flex; flex-direction: column; gap: 12px;
+      background: #fff;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      border-radius: 12px;
+      padding: 20px;
+      width: 90%;
+      max-width: 900px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
       margin-top: 20px;
     }
 
     textarea {
-      resize: none; font-size: 16px; line-height: 1.5; padding: 12px;
-      border-radius: 8px; border: 1px solid #ccc; transition: 0.2s;
+      resize: none;
+      font-size: 16px;
+      line-height: 1.5;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid #ccc;
+      transition: 0.2s;
     }
-    textarea:focus { border-color: #1e88e5; box-shadow: 0 0 0 3px rgba(30,136,229,0.2); }
+    textarea:focus {
+      border-color: #1e88e5;
+      box-shadow: 0 0 0 3px rgba(30,136,229,0.2);
+      outline: none;
+    }
 
     button {
-      align-self: flex-end; background: #1e88e5; color: #fff;
-      border: none; border-radius: 8px;
-      font-size: 16px; padding: 10px 20px; cursor: pointer; transition: 0.2s;
+      align-self: flex-end;
+      background: #1e88e5;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      padding: 10px 20px;
+      cursor: pointer;
+      transition: 0.2s;
     }
     button:hover { background: #1565c0; }
 
-    #result {
-      width: 90%; max-width: 700px; background: #fff;
-      margin-top: 25px; padding: 20px;
-      border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+    .answers-wrapper {
+      width: 90%;
+      max-width: 1100px;
+      margin-top: 25px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      padding: 16px 18px;
       line-height: 1.7;
-      white-space: pre-wrap;
     }
 
-    #logs {
-      background: #f1f1f1; border-radius: 8px; padding: 12px;
-      font-family: monospace; font-size: 14px;
-      margin-top: 16px; white-space: pre-wrap; color: #333;
+    .card h3 {
+      margin: 0 0 8px 0;
+      font-size: 15px;
+      color: #555;
+      font-weight: 600;
     }
 
-    .loading { text-align: center; font-size: 18px; color: #666; animation: blink 1.2s infinite; }
-    @keyframes blink { 0%{opacity:0.3;} 50%{opacity:1;} 100%{opacity:0.3;} }
+    #answer-main,
+    #answer-a,
+    #answer-b {
+      font-size: 15px;
+      white-space: normal;
+    }
+
+    .answer-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    #stream-log {
+      background:#f8f9fa;
+      border-radius:10px;
+      padding:12px;
+      margin-top:5px;
+      font-family:monospace;
+      font-size:14px;
+      color:#333;
+      max-height:260px;
+      overflow-y:auto;
+      border:1px solid #ddd;
+      white-space:pre-line;
+    }
+
+    .loading {
+      text-align: left;
+      font-size: 14px;
+      color: #666;
+    }
   </style>
 </head>
 <body>
 
-<h2>🔍 연구 논문 질의응답</h2>
+<h2>🔍 연구 논문 질의응답 (듀얼 임베딩 비교)</h2>
 
 <form id="qform">
   <textarea name="question" id="question" placeholder="질문을 입력하세요..." rows="3"></textarea>
   <button type="submit">질의</button>
 </form>
 
-<div id="result"></div>
-<div id="stream-log"
-     style="white-space:pre-line;
-            background:#f8f9fa;
-            border-radius:10px;
-            padding:12px;
-            margin-top:15px;
-            font-family:monospace;
-            font-size:14px;
-            color:#333;
-            max-height:300px;
-            overflow-y:auto;
-            border:1px solid #ddd;">
+<div class="answers-wrapper">
+
+  <!-- ↓↓↓ CHAT 모드 전용 메인 응답 카드 추가 ↓↓↓ -->
+  <div id="answer-main-card" class="card" style="display:none;">
+    <h3>💬 Chat 모드 응답</h3>
+    <div id="answer-main" class="loading">
+      RAG가 필요하지 않은 경우 일반 Chat 응답이 여기에 표시됩니다.
+    </div>
+  </div>
+  <!-- ↑↑↑ CHAT 모드 전용 메인 응답 카드 ↑↑↑ -->
+
+  <!-- A / B 비교 영역 -->
+  <div class="answer-grid">
+    <div id="answer-a-card" class="card">
+      <h3>🅰 RAG-A 응답 (bge-m3 스택)</h3>
+      <div id="answer-a" class="loading">
+        듀얼 RAG 모드에서 A 스택 응답이 여기에 표시됩니다.
+      </div>
+    </div>
+    <div id="answer-b-card" class="card">
+      <h3>🅱 RAG-B 응답 (e5 스택)</h3>
+      <div id="answer-b" class="loading">
+        듀얼 RAG 모드에서 B 스택 응답이 여기에 표시됩니다.
+      </div>
+    </div>
+  </div>
+
+  <!-- 스트림 로그 -->
+  <div class="card">
+    <h3>📜 스트리밍 로그</h3>
+    <div id="stream-log"></div>
+  </div>
 </div>
+
 <script>
   const form = document.getElementById("qform");
-  const resultDiv = document.getElementById("result");
+  const mainDiv = document.getElementById("answer-main");
+  const mainCard = document.getElementById("answer-main-card");
+  const aDiv = document.getElementById("answer-a");
+  const bDiv = document.getElementById("answer-b");
   const logBox = document.getElementById("stream-log");
 
+  // ------------------------------
+  // HTML 이스케이프
+  // ------------------------------
+  function escapeHtml(str) {
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+  }
+
+  // ------------------------------
+  // 모델 응답 보기 좋게 포맷팅
+  //  - case A: * 로 나뉜 bullet 스타일
+  //  - case B: "1. 제목 ..." 번호 리스트 스타일
+  //  + 참고문헌 섹션 분리
+  // ------------------------------
+  function formatAnswer(rawText) {
+    if (!rawText || !rawText.trim()) {
+      return "<p>(빈 응답)</p>";
+    }
+
+    // 1) "참고문헌" 기준으로 본문 / 참고문헌 분리
+    let body = rawText;
+    let refs = "";
+
+    const refMatch = rawText.match(/([\s\S]*?)(?:참고문헌[:\s]*)([\s\S]*)/);
+    if (refMatch) {
+      body = refMatch[1].trim();
+      refs = refMatch[2].trim();
+    } else {
+      body = rawText.trim();
+    }
+
+    let html = "";
+
+    // -------------------------------------------------
+    // 2) case A: '*' 로 구분된 bullet 스타일
+    // -------------------------------------------------
+    if (body.includes("*")) {
+      const parts = body.split("*");
+      const intro = parts[0].trim();
+      const bulletCandidates = parts.slice(1);
+
+      if (intro) {
+        html += `<p>${escapeHtml(intro)}</p>`;
+      }
+
+      const bullets = bulletCandidates
+          .map(t => t.trim())
+          .filter(t => t.length > 0);
+
+      if (bullets.length > 0) {
+        html += "<ul>";
+        for (const b of bullets) {
+          html += `<li>${escapeHtml(b)}</li>`;
+        }
+        html += "</ul>";
+      }
+
+    } else {
+      // -------------------------------------------------
+      // 3) case B: "1. 제목 ..." 번호 리스트 스타일
+      // -------------------------------------------------
+
+      // 숫자. 패턴 앞에 줄바꿈 넣어서 토막으로 만들기 쉽게
+      let normalized = body.replace(/(\d+)\.\s*/g, "\n$1. ");
+
+      const lines = normalized.split(/\n+/);
+      const introLines = [];
+      const items = [];
+      let current = null;
+
+      for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trim();
+        if (!line) continue;
+
+        const m = line.match(/^(\d+)\.\s*(.*)$/);
+        if (m) {
+          // 새 번호 항목 시작
+          if (current) items.push(current);
+
+          const num = m[1];
+          let title = m[2].trim();
+
+          // "1."만 있고 제목이 없으면, 다음 줄을 제목으로 사용
+          if (!title && i + 1 < lines.length) {
+            const next = lines[i + 1].trim();
+            if (next) {
+              title = next;
+              i++; // 제목으로 사용했으니 한 줄 건너뛴다
+            }
+          }
+
+          // 제목 끝이 콜론이면 제거
+          title = title.replace(/:$/, "");
+
+          current = { num, title, body: "" };
+        } else {
+          // 일반 텍스트 라인
+          if (!current) {
+            introLines.push(line);
+          } else {
+            current.body += (current.body ? "\n" : "") + line;
+          }
+        }
+      }
+      if (current) items.push(current);
+
+      // 인트로 문단
+      if (introLines.length > 0) {
+        html += `<p>${escapeHtml(introLines.join(" "))}</p>`;
+      }
+
+      // 번호 리스트 렌더링
+      if (items.length > 0) {
+        html += "<ol>";
+        for (const it of items) {
+          const title = it.title ? `<strong>${escapeHtml(it.title)}</strong>` : "";
+          const bodyText = it.body ? escapeHtml(it.body) : "";
+          if (title && bodyText) {
+            html += `<li>${title}<br>${bodyText}</li>`;
+          } else if (title) {
+            html += `<li>${title}</li>`;
+          } else {
+            html += `<li>${bodyText}</li>`;
+          }
+        }
+        html += "</ol>";
+      }
+    }
+
+    // -------------------------------------------------
+    // 4) 참고문헌 섹션 (공통)
+    // -------------------------------------------------
+    if (refs) {
+      let refsEscaped = escapeHtml(refs);
+      // [1], [2] 같은 번호는 굵게
+      refsEscaped = refsEscaped.replace(/\[(\d+)\]/g, '<strong>[$1]</strong>');
+      html += `<h4 style="margin-top:20px;">참고문헌</h4>`;
+      html += `<p style="font-size:14px; color:#555; white-space:pre-line;">${refsEscaped}</p>`;
+    }
+
+    return html;
+  }
+
+  // ------------------------------
+  // 폼 제출 + SSE 스트리밍 처리
+  // ------------------------------
   form.onsubmit = async (e) => {
     e.preventDefault();
     const q = document.getElementById("question").value.trim();
     if (!q) return;
 
     // 초기화
-    resultDiv.textContent = "⏳ 응답을 불러오는 중...";
+    if (mainDiv) {
+      mainDiv.textContent = "⏳ 일반 Chat 응답 대기 중...";
+      mainDiv.classList.add("loading");
+      mainDiv.innerHTML = mainDiv.textContent;
+    }
+    if (mainCard) {
+      mainCard.style.display = "none";
+    }
+
+    aDiv.textContent = "⏳ RAG-A 응답 대기 중...";
+    bDiv.textContent = "⏳ RAG-B 응답 대기 중...";
+    aDiv.classList.add("loading");
+    bDiv.classList.add("loading");
     logBox.textContent = "";
+
+    let rawMain = "";
+    let rawA = "";
+    let rawB = "";
+
+    let seenA = false;
+    let seenB = false;
 
     if (window.eventSource) window.eventSource.close();
 
@@ -91,21 +353,48 @@
     const es = new EventSource(url);
     window.eventSource = es;
 
-    let rawText = "";   // 전체 원본 텍스트(마크다운 그대로)
-
     es.onmessage = (ev) => {
       const line = ev.data;
 
       // 종료 처리
       if (line === "[END]") {
         es.close();
-        resultDiv.innerHTML = marked.parse(rawText || "(빈 응답)");
+
+        // A/B 응답 포맷팅
+        if (seenA) {
+          aDiv.classList.remove("loading");
+          aDiv.innerHTML = rawA ? formatAnswer(rawA) : "(A 스택에서 유효한 응답이 없습니다)";
+        }
+        if (seenB) {
+          bDiv.classList.remove("loading");
+          bDiv.innerHTML = rawB ? formatAnswer(rawB) : "(B 스택에서 유효한 응답이 없습니다)";
+        }
+
+        // 듀얼 RAG가 아닌 경우 → 메인 응답만 포맷팅 (CHAT 모드)
+        if (!seenA && !seenB && mainDiv) {
+          mainDiv.classList.remove("loading");
+          mainDiv.innerHTML = formatAnswer(rawMain || "(빈 응답)");
+          mainCard.style.display = "block";
+
+          // RAG 카드에는 안내 문구만
+          aDiv.classList.remove("loading");
+          bDiv.classList.remove("loading");
+          aDiv.textContent = "이번 질문은 RAG가 필요하지 않다고 판단되어 일반 Chat으로 처리되었습니다.";
+          bDiv.textContent = "이번 질문은 RAG가 필요하지 않다고 판단되어 일반 Chat으로 처리되었습니다.";
+        }
         return;
       }
 
       // STEP 로그
       if (line.startsWith("[STEP")) {
         logBox.textContent += "🔹 " + line + "\n";
+        logBox.scrollTop = logBox.scrollHeight;
+        return;
+      }
+
+      // RAG-A / RAG-B 헤더 / 구분선
+      if (line.includes("[RAG-A]") || line.includes("[RAG-B]") || line.startsWith("===")) {
+        logBox.textContent += line + "\n";
         logBox.scrollTop = logBox.scrollHeight;
         return;
       }
@@ -117,23 +406,70 @@
         return;
       }
 
+      if (!line.trim()) return;
+
       // -------------------------
       // 🤖 LLM 토큰 스트리밍
       // -------------------------
-      rawText += line;                 // ← 공백 추가하지 않음
 
-      if (resultDiv.textContent.startsWith("⏳")) {
-        resultDiv.textContent = "";
+      // A 스택 토큰
+      if (line.startsWith("[A]")) {
+        seenA = true;
+        const text = line.replace(/^\[A\]\s?/, ""); // [A] 제거
+        rawA += text;
+
+        if (aDiv.textContent.startsWith("⏳")) {
+          aDiv.textContent = "";
+          aDiv.classList.remove("loading");
+        }
+        aDiv.textContent += text;
+        aDiv.scrollTop = aDiv.scrollHeight;
+        return;
       }
 
-      resultDiv.textContent += line;  // ← 공백 추가하면 안 됨
-      resultDiv.scrollTop = resultDiv.scrollHeight;
+      // B 스택 토큰
+      if (line.startsWith("[B]")) {
+        seenB = true;
+        const text = line.replace(/^\[B\]\s?/, ""); // [B] 제거
+        rawB += text;
+
+        if (bDiv.textContent.startsWith("⏳")) {
+          bDiv.textContent = "";
+          bDiv.classList.remove("loading");
+        }
+        bDiv.textContent += text;
+        bDiv.scrollTop = bDiv.scrollHeight;
+        return;
+      }
+
+      // -------------------------
+      // 일반 CHAT 모드 토큰
+      // (A/B 태그가 없고, 아직 RAG-A/B 응답이 시작되지 않은 경우)
+      // -------------------------
+      if (!seenA && !seenB && mainDiv) {
+        rawMain += line;
+
+        if (mainDiv.textContent.startsWith("⏳") || mainDiv.classList.contains("loading")) {
+          mainDiv.textContent = "";
+          mainDiv.classList.remove("loading");
+          mainCard.style.display = "block";
+        }
+        mainDiv.textContent += line;
+        mainDiv.scrollTop = mainDiv.scrollHeight;
+      } else {
+        // 혹시 모를 이상 토큰은 로그에만 남김
+        logBox.textContent += line + "\n";
+        logBox.scrollTop = logBox.scrollHeight;
+      }
     };
 
     es.onerror = (err) => {
       console.error("SSE error:", err);
       logBox.textContent += "\n❗ SSE 오류 발생\n";
       es.close();
+      if (mainDiv) mainDiv.classList.remove("loading");
+      aDiv.classList.remove("loading");
+      bDiv.classList.remove("loading");
     };
   };
 </script>
