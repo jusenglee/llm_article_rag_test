@@ -40,6 +40,12 @@ TRITON_URL   = os.getenv("TRITON_URL", "211.241.177.73:8001")
 MODEL_NAME   = os.getenv("TRITON_MODEL", "gemma_vllm_0")
 TOKENIZER_ID = os.getenv("TOKENIZER_ID", "./data/") # 로컬 경로 혹은 모델명
 
+# === B 스택용 설정 (두 번째 임베딩 + 벡터DB) ===
+QDRANT_HOST_B  = os.getenv("QDRANT_HOST_B", QDRANT_HOST)
+QDRANT_PORT_B  = int(os.getenv("QDRANT_PORT_B", QDRANT_PORT))
+COLLECTION_B   = os.getenv("QDRANT_COLLECTION_B", "e5_rag")
+EMBED_MODEL_B  = os.getenv("EMBEDDING_MODEL_B", "intfloat/multilingual-e5-large")
+
 # 하이퍼파라미터
 TOP_K_BASE = 20        # 검색 후보군 (넉넉하게 잡음)
 TOP_K_RETURN = 20       # 최종 반환 개수
@@ -53,12 +59,37 @@ FUZZ_MIN        = 40
 CTX_TOKEN_BUDGET = 4096
 SNIPPET_MAX_CHARS = 4096
 
+
+RAG_STRONG_KW = [
+    "논문", "연구", "학술", "페이퍼", "paper", "research", "citation",
+    "데이터셋", "dataset", "알고리즘", "모델", "architecture", "원리",
+    "동향", "기술", "spec", "스펙", "튜닝", "세부", "비교", "차이",
+    "정의", "공식", "증명", "성능", "벤치마크", "benchmark",
+]
+
+CHAT_STRONG_KW = [
+    "심심", "연애", "썰", "잡담", "고민", "위로", "기분", "우울",
+    "사랑", "친구", "가족", "인생 조언", "삶의 의미",
+]
+
+CASUAL_KW = [
+    "날씨", "기분", "안녕", "좋아", "이름", "몇 시", "누구야", "누구니",
+    "ㅋㅋ", "ㅎㅎ", "ㅠㅠ", "ㄷㄷ", "??", "잘자", "굿나잇", "ㅎㅇ",
+]
+
+TECH_PATTERNS = [
+    r"(~에 대해|에 대해서)\s*알려줘",
+    r"(동향|원리|구조|구현|작동 방식)",
+    r"(비교|차이점|장단점)",
+    r"(요약|정리|정리해줘|설명해줘)",
+]
+
 # ---------------------------
 # 전역 리소스 캐시
 # ---------------------------
-_qdr, _emb, _retriever = None, None, None
-_triton_client = None   # Triton Client 재사용을 위한 전역 변수
-
+_qdr, _emb, _retriever = None, None, None       # A 스택
+_qdr2, _emb2, _retriever2 = None, None, None    # B 스택
+_triton_client = None
 # Tokenizer 로드
 try:
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID, trust_remote_code=True)
@@ -423,14 +454,109 @@ def build_context(hits):
 # ---------------------------
 # Main Logic (Gating & Execution)
 # ---------------------------
+def _contains_any(text: str, patterns: list[str]) -> bool:
+    return any(p in text for p in patterns)
+
+def _match_any_regex(text: str, patterns: list[str]) -> bool:
+    return any(re.search(p, text) for p in patterns)
+
+def _classify_query_rule_based(query: str) -> str:
+    """
+    간단 룰 기반 분류
+    return: "RAG" | "CHAT" | "UNSURE"
+    """
+    q = (query or "").strip()
+    q_lower = q.lower()
+
+    # 너무 짧은 단문 + 물음표도 없음 → 거의 잡담
+    if len(q) <= 5 and "?" not in q:
+        return "CHAT"
+
+    # 명확한 캐주얼/잡담 패턴
+    if _contains_any(q, CASUAL_KW) or _contains_any(q, CHAT_STRONG_KW):
+        return "CHAT"
+
+    # 연도, 버전 등 숫자 정보가 섞인 경우 → 정보성일 확률 높음
+    if re.search(r"20\d{2}", q) or re.search(r"\d+\.\d+", q):
+        # 기술 키워드 섞여있으면 거의 확실히 RAG
+        if _contains_any(q, RAG_STRONG_KW) or _match_any_regex(q, TECH_PATTERNS):
+            return "RAG"
+
+    # 논문/연구/기술/원리/동향 등 명확한 정보 탐색 의도
+    if _contains_any(q, RAG_STRONG_KW) or _match_any_regex(q, TECH_PATTERNS):
+        return "RAG"
+
+    # 영어 질문형 (what, how, why...) 이면 정보성일 가능성 큼
+    if re.search(r"\b(what|how|why|when|where|difference|compare|latest|recent)\b", q_lower):
+        return "RAG"
+
+    # 여기까지도 쏙 안 걸리면 애매
+    return "UNSURE"
 
 def decide_rag_needed(query: str) -> bool:
-    # 간단한 규칙 기반 필터링 우선
-    casual = ["안녕", "날씨", "이름", "뭐해", "반가워"]
-    if any(c in query for c in casual):
+    """
+    1차: 룰 기반으로 RAG / CHAT 분류
+    2차: LLM에게 최종 결정 맡기되, 출력 파싱을 엄격하게
+    3차: 파싱 실패 시 보수적으로(조금 RAG 쪽으로) 디폴트
+    """
+
+    q = (query or "").strip()
+    logger.info(f"[GATE] decide_rag_needed() query={q!r}")
+
+    # ---------- 1차: 룰 기반 ----------
+    rule_result = _classify_query_rule_based(q)
+    logger.info(f"[GATE] rule_based_result = {rule_result}")
+
+    if rule_result == "RAG":
+        # 확실히 정보성/기술 질문이라고 판단되면 바로 RAG
+        return True
+    if rule_result == "CHAT":
+        # 확실히 잡담/감정/일상 대화이면 바로 CHAT
         return False
 
-    # LLM 판단
-    prompt = f"Is this query asking for factual knowledge? (YES/NO)\nQuery: {query}\nAnswer:"
-    resp = triton_infer(prompt, stream=False, max_tokens=10)
-    return "yes" in resp.lower()
+    # ---------- 2차: LLM 게이트 ----------
+    prompt = f"""You are a controller that decides whether to use Retrieval-Augmented Generation (RAG, vector DB search).
+If the user asks for factual, technical, or academic information, answer "RAG".
+If the user asks for casual talk, opinions, or daily conversation, answer "CHAT".
+Return EXACTLY one word: RAG or CHAT.
+
+Query: {q}
+Answer:"""
+
+    try:
+        resp = triton_infer(
+            prompt,
+            stream=False,
+            max_tokens=8,
+            temperature=0.0,   # 판단 용도 → 결정적 출력
+            top_p=1.0,
+        )
+        resp_str = str(resp).strip().upper()
+        logger.info(f"[GATE] LLM raw resp = {resp_str!r}")
+
+        # 스트리밍/디코딩 문제 방지를 위해 관대한 파싱
+        if "RAG" in resp_str and "CHAT" not in resp_str:
+            logger.info("[GATE] final_decision = RAG (LLM)")
+            return True
+        if "CHAT" in resp_str and "RAG" not in resp_str:
+            logger.info("[GATE] final_decision = CHAT (LLM)")
+            return False
+
+        logger.warning(f"[GATE] LLM output not clean RAG/CHAT: {resp_str!r}")
+    except Exception as e:
+        logger.warning(f"[GATE] LLM gating failed: {e}")
+
+    # ---------- 3차: fallback ----------
+    # 여기까지 왔다는 건 LLM이 이상한 문자열을 뱉었거나, 통신 실패.
+    # 기본은 "정보성 쿼리일 가능성이 조금이라도 있으면 RAG" 쪽으로.
+    # (이 부분은 운영하면서 튜닝 포인트)
+    logger.info("[GATE] fallback decision path triggered")
+
+    # 물음표 + 길이가 어느 정도 되면 정보성일 확률이 높으니 RAG로
+    if ("?" in q or "알려줘" in q or "설명" in q or "정리" in q) and len(q) >= 10:
+        logger.info("[GATE] fallback -> RAG")
+        return True
+
+    # 위 조건도 아니면 CHAT으로 처리
+    logger.info("[GATE] fallback -> CHAT")
+    return False

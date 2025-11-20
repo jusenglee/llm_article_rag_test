@@ -3,49 +3,104 @@
 <head>
   <meta charset="UTF-8">
   <title>RAG Query Web</title>
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
-    body { font-family: 'Segoe UI', Pretendard, sans-serif; background: #f6f8fa; color: #222; margin: 0;
-      display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
-    h2 { margin-top: 60px; color: #1e88e5; font-weight: 700; }
+    body {
+      font-family: 'Segoe UI', Pretendard, sans-serif;
+      background: #f6f8fa;
+      color: #222;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+    }
+    h2 {
+      margin-top: 60px;
+      color: #1e88e5;
+      font-weight: 700;
+    }
 
     form {
-      background: #fff; box-shadow: 0 2px 10px rgba(0,0,0,0.08);
-      border-radius: 12px; padding: 20px;
-      width: 90%; max-width: 700px;
-      display: flex; flex-direction: column; gap: 12px;
+      background: #fff;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      border-radius: 12px;
+      padding: 20px;
+      width: 90%;
+      max-width: 700px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
       margin-top: 20px;
     }
 
     textarea {
-      resize: none; font-size: 16px; line-height: 1.5; padding: 12px;
-      border-radius: 8px; border: 1px solid #ccc; transition: 0.2s;
+      resize: none;
+      font-size: 16px;
+      line-height: 1.5;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid #ccc;
+      transition: 0.2s;
     }
-    textarea:focus { border-color: #1e88e5; box-shadow: 0 0 0 3px rgba(30,136,229,0.2); }
+    textarea:focus {
+      border-color: #1e88e5;
+      box-shadow: 0 0 0 3px rgba(30,136,229,0.2);
+      outline: none;
+    }
 
     button {
-      align-self: flex-end; background: #1e88e5; color: #fff;
-      border: none; border-radius: 8px;
-      font-size: 16px; padding: 10px 20px; cursor: pointer; transition: 0.2s;
+      align-self: flex-end;
+      background: #1e88e5;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      padding: 10px 20px;
+      cursor: pointer;
+      transition: 0.2s;
     }
-    button:hover { background: #1565c0; }
+    button:hover {
+      background: #1565c0;
+    }
 
     #result {
-      width: 90%; max-width: 700px; background: #fff;
-      margin-top: 25px; padding: 20px;
-      border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      width: 90%;
+      max-width: 700px;
+      background: #fff;
+      margin-top: 25px;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
       line-height: 1.7;
-      white-space: pre-wrap;
     }
 
-    #logs {
-      background: #f1f1f1; border-radius: 8px; padding: 12px;
-      font-family: monospace; font-size: 14px;
-      margin-top: 16px; white-space: pre-wrap; color: #333;
+    #stream-log {
+      white-space: pre-line;
+      background: #f8f9fa;
+      border-radius: 10px;
+      padding: 12px;
+      margin-top: 15px;
+      font-family: monospace;
+      font-size: 14px;
+      color: #333;
+      max-height: 300px;
+      overflow-y: auto;
+      border: 1px solid #ddd;
+      width: 90%;
+      max-width: 700px;
     }
 
-    .loading { text-align: center; font-size: 18px; color: #666; animation: blink 1.2s infinite; }
-    @keyframes blink { 0%{opacity:0.3;} 50%{opacity:1;} 100%{opacity:0.3;} }
+    .loading {
+      text-align: center;
+      font-size: 18px;
+      color: #666;
+      animation: blink 1.2s infinite;
+    }
+    @keyframes blink {
+      0% { opacity: 0.3; }
+      50% { opacity: 1; }
+      100% { opacity: 0.3; }
+    }
   </style>
 </head>
 <body>
@@ -58,24 +113,165 @@
 </form>
 
 <div id="result"></div>
-<div id="stream-log"
-     style="white-space:pre-line;
-            background:#f8f9fa;
-            border-radius:10px;
-            padding:12px;
-            margin-top:15px;
-            font-family:monospace;
-            font-size:14px;
-            color:#333;
-            max-height:300px;
-            overflow-y:auto;
-            border:1px solid #ddd;">
-</div>
+
+<div id="stream-log"></div>
+
 <script>
   const form = document.getElementById("qform");
   const resultDiv = document.getElementById("result");
   const logBox = document.getElementById("stream-log");
 
+  // ------------------------------
+  // HTML 이스케이프
+  // ------------------------------
+  function escapeHtml(str) {
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+  }
+
+  // ------------------------------
+  // 모델 응답 보기 좋게 포맷팅
+  //  - case A: * 로 나뉜 bullet 스타일
+  //  - case B: "1. 제목 ..." 번호 리스트 스타일
+  //  + 참고문헌 섹션 분리
+  // ------------------------------
+  function formatAnswer(rawText) {
+    if (!rawText || !rawText.trim()) {
+      return "<p>(빈 응답)</p>";
+    }
+
+    // 1) "참고문헌" 기준으로 본문 / 참고문헌 분리 (":" 유무 모두 처리)
+    let body = rawText;
+    let refs = "";
+
+    const refMatch = rawText.match(/([\s\S]*?)(?:참고문헌[:\s]*)([\s\S]*)/);
+    if (refMatch) {
+      body = refMatch[1].trim();
+      refs = refMatch[2].trim();
+    } else {
+      body = rawText.trim();
+    }
+
+    let html = "";
+
+    // -------------------------------------------------
+    // 2) case A: '*' 로 구분된 bullet 스타일
+    // -------------------------------------------------
+    if (body.includes("*")) {
+      const parts = body.split("*");
+      const intro = parts[0].trim();
+      const bulletCandidates = parts.slice(1);
+
+      if (intro) {
+        html += `<p>${escapeHtml(intro)}</p>`;
+      }
+
+      const bullets = bulletCandidates
+          .map(t => t.trim())
+          .filter(t => t.length > 0);
+
+      if (bullets.length > 0) {
+        html += "<ul>";
+        for (const b of bullets) {
+          html += `<li>${escapeHtml(b)}</li>`;
+        }
+        html += "</ul>";
+      }
+
+    } else {
+      // -------------------------------------------------
+      // 3) case B: "1. 제목 ..." 번호 리스트 스타일
+      // -------------------------------------------------
+
+      // 숫자. 패턴 앞에 줄바꿈을 강제로 넣어 토막으로 만들기 쉽게
+      // 예) "...습니다.1.\n\n디지털 의약:" → "...습니다.\n1.\n\n디지털 의약:"
+      let normalized = body.replace(/(\d+)\.\s*/g, "\n$1. ");
+
+      const lines = normalized.split(/\n+/);
+      const introLines = [];
+      const items = [];
+      let current = null;
+
+      for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trim();
+        if (!line) continue;
+
+        const m = line.match(/^(\d+)\.\s*(.*)$/);
+        if (m) {
+          // 새 번호 항목 시작
+          if (current) items.push(current);
+
+          const num = m[1];
+          let title = m[2].trim();
+
+          // "1."만 있고 제목이 없으면, 다음 줄을 제목으로 사용
+          if (!title && i + 1 < lines.length) {
+            const next = lines[i + 1].trim();
+            if (next) {
+              title = next;
+              i++; // 제목으로 사용했으니 한 줄 건너뛴다
+            }
+          }
+
+          // 제목 끝이 콜론이면 제거
+          title = title.replace(/:$/, "");
+
+          current = { num, title, body: "" };
+        } else {
+          // 일반 텍스트 라인
+          if (!current) {
+            // 아직 어떤 항목도 시작 안 했으면 인트로 문장으로 축적
+            introLines.push(line);
+          } else {
+            current.body += (current.body ? "\n" : "") + line;
+          }
+        }
+      }
+      if (current) items.push(current);
+
+      // 인트로 문단
+      if (introLines.length > 0) {
+        html += `<p>${escapeHtml(introLines.join(" "))}</p>`;
+      }
+
+      // 번호 리스트 렌더링
+      if (items.length > 0) {
+        html += "<ol>";
+        for (const it of items) {
+          const title = it.title ? `<strong>${escapeHtml(it.title)}</strong>` : "";
+          const bodyText = it.body ? escapeHtml(it.body) : "";
+          if (title && bodyText) {
+            html += `<li>${title}<br>${bodyText}</li>`;
+          } else if (title) {
+            html += `<li>${title}</li>`;
+          } else {
+            html += `<li>${bodyText}</li>`;
+          }
+        }
+        html += "</ol>";
+      }
+    }
+
+    // -------------------------------------------------
+    // 4) 참고문헌 섹션 (공통)
+    // -------------------------------------------------
+    if (refs) {
+      let refsEscaped = escapeHtml(refs);
+      // [1], [2] 같은 번호는 굵게
+      refsEscaped = refsEscaped.replace(/\[(\d+)\]/g, '<strong>[$1]</strong>');
+      html += `<h4 style="margin-top:20px;">참고문헌</h4>`;
+      html += `<p style="font-size:14px; color:#555; white-space:pre-line;">${refsEscaped}</p>`;
+    }
+
+    return html;
+  }
+
+  // ------------------------------
+  // 폼 제출 + SSE 스트리밍 처리
+  // ------------------------------
   form.onsubmit = async (e) => {
     e.preventDefault();
     const q = document.getElementById("question").value.trim();
@@ -83,6 +279,7 @@
 
     // 초기화
     resultDiv.textContent = "⏳ 응답을 불러오는 중...";
+    resultDiv.classList.add("loading");
     logBox.textContent = "";
 
     if (window.eventSource) window.eventSource.close();
@@ -91,7 +288,7 @@
     const es = new EventSource(url);
     window.eventSource = es;
 
-    let rawText = "";   // 전체 원본 텍스트(마크다운 그대로)
+    let rawText = "";   // 전체 원본 텍스트 누적
 
     es.onmessage = (ev) => {
       const line = ev.data;
@@ -99,7 +296,9 @@
       // 종료 처리
       if (line === "[END]") {
         es.close();
-        resultDiv.innerHTML = marked.parse(rawText || "(빈 응답)");
+        const html = formatAnswer(rawText);
+        resultDiv.classList.remove("loading");
+        resultDiv.innerHTML = html;
         return;
       }
 
@@ -120,13 +319,16 @@
       // -------------------------
       // 🤖 LLM 토큰 스트리밍
       // -------------------------
-      rawText += line;                 // ← 공백 추가하지 않음
+      rawText += line;   // 후처리용 전체 텍스트 누적
 
       if (resultDiv.textContent.startsWith("⏳")) {
         resultDiv.textContent = "";
+        resultDiv.classList.remove("loading");
       }
 
-      resultDiv.textContent += line;  // ← 공백 추가하면 안 됨
+      // 스트리밍 중에는 그냥 생텍스트로 보여주고,
+      // [END]에서 예쁘게 갈아끼우는 방식
+      resultDiv.textContent += line;
       resultDiv.scrollTop = resultDiv.scrollHeight;
     };
 
@@ -134,6 +336,7 @@
       console.error("SSE error:", err);
       logBox.textContent += "\n❗ SSE 오류 발생\n";
       es.close();
+      resultDiv.classList.remove("loading");
     };
   };
 </script>
