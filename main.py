@@ -6,19 +6,12 @@ from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse
 
-from query_pipeline import (
-    build_rag_objects_dual,
-    triton_infer,
-    expand_query_kor,
-    dense_retrieve_hybrid,
-    rrf_rerank,
-    build_context,
-    decide_rag_needed,
-    COLLECTION,
-    COLLECTION_B,
-    ensure_single_model_loaded,  # 👈 query_pipeline에 추가
-    unload_model_safe, get_tokenizer_for_model,  # 👈 query_pipeline에 추가
-)
+from rag_pipeline import decide_rag_needed, run_rag_ab_compare
+from rag_store import build_rag_objects_dual
+from retrieval import expand_query_kor, dense_retrieve_hybrid, rrf_rerank, build_context
+from settings import COLLECTION, COLLECTION_B, TRITON_URL
+from triton_client import triton_infer, get_tokenizer_for_model, ensure_single_model_loaded, unload_model_safe, \
+    get_triton_client
 
 # ---------------------------
 # 초기 설정
@@ -109,51 +102,86 @@ async def query_stream(question: str, model: str = "gpt"):
     model_name = MODEL_MAP[model_key]
     logger.info(f"[QUERY] model_key={model_key}, model_name={model_name}, question={question!r}")
     tok = get_tokenizer_for_model(model_name)
+
     async def event_gen():
         import asyncio
 
-        # 여기서부터 이 요청 동안은 model_name 하나만 사용
         await asyncio.sleep(0)  # 이벤트 루프 양보용
 
-        # 0. 한 번에 하나의 모델만 로드되도록 보장
+        # 0. Triton에서 모델 로드 과정을 사용자에게 그대로 노출
         try:
-            logger.info(f"[TRITON] ensure_single_model_loaded({model_name})")
-            ensure_single_model_loaded(model_name)
+            cli = get_triton_client()
+
+            # 0-1) 레포지토리 인덱스 조회
+            yield f"data: [MODEL] Triton 연결 ({TRITON_URL}) 후 모델 로드 시도 중...\n\n"
+            repo = cli.get_model_repository_index()
+            names = [getattr(m, "name", "?") for m in getattr(repo, "models", [])]
+            yield f"data: [MODEL] 현재 등록된 모델: {', '.join(names)}\n\n"
+
+            # 0-2) target 이외 모델 UNLOAD
+            for m in getattr(repo, "models", []):
+                name = getattr(m, "name", None)
+                if not name or name == model_name:
+                    continue
+                try:
+                    if cli.is_model_ready(name):
+                        yield f"data: [MODEL] 다른 모델 언로드 요청: {name}\n\n"
+                        cli.unload_model(name)
+                        yield f"data: [MODEL] 언로드 완료: {name}\n\n"
+                except Exception as e:
+                    logger.warning(f"[TRITON] unload_model({name}) failed: {e}")
+                    yield f"data: [MODEL] 언로드 실패({name}): {type(e).__name__}: {e}\n\n"
+
+            # 0-3) target 모델 상태 확인
+            try:
+                if cli.is_model_ready(model_name):
+                    yield f"data: [MODEL] {model_name} 이미 READY 상태입니다.\n\n"
+                else:
+                    # 0-4) target 모델 로드 시작
+                    yield f"data: [MODEL] {model_name} 로드 시작...\n\n"
+                    cli.load_model(model_name)
+                    start = time.time()
+                    timeout = 120.0
+
+                    # 0-5) READY 될 때까지 polling + 진행 상황 SSE 전송
+                    while True:
+                        await asyncio.sleep(0.5)
+                        elapsed = time.time() - start
+
+                        try:
+                            if cli.is_model_ready(model_name):
+                                yield f"data: [MODEL] {model_name} READY (t={elapsed:.2f}s)\n\n"
+                                break
+                        except Exception as e:
+                            logger.warning(f"[TRITON] is_model_ready({model_name}) check failed: {e}")
+                            yield f"data: [MODEL] 상태 확인 실패: {type(e).__name__}: {e}\n\n"
+
+                        if elapsed > timeout:
+                            raise TimeoutError(
+                                f"Timeout while waiting for model {model_name} to be READY"
+                            )
+
+                        # 진행 중인 상태도 계속 쏴줌
+                        yield f"data: [MODEL] {model_name} 로딩 중... (elapsed={elapsed:.1f}s)\n\n"
+
+            except Exception as e:
+                raise e
+
         except Exception as e:
-            err = f"ensure_single_model_loaded failed: {type(e).__name__}: {e}"
+            err = f"Triton 모델 로드 단계에서 오류: {type(e).__name__}: {e}"
             traceback.print_exc()
             yield f"data: ⚠️ {err}\n\n"
             yield "data: [END]\n\n"
             return
 
         try:
-            # 클라이언트 로그용 안내
-            yield f"data: [MODEL] 모델 로드 준비 (target={model_name})\n\n"
-
-            t0 = time.time()
-            logger.info(f"[TRITON] ensure_single_model_loaded({model_name})")
-            ensure_single_model_loaded(model_name)
-            t1 = time.time()
-
-            # 실제 로드 완료 알림
-            elapsed = t1 - t0
-            yield f"data: [MODEL] 모델 로드 완료 (active={model_name}, t={elapsed:.2f}s)\n\n"
-
-        except Exception as e:
-            err = f"ensure_single_model_loaded failed: {type(e).__name__}: {e}"
-            traceback.print_exc()
-            # 클라이언트에도 에러 표시
-            yield f"data: ⚠️ {err}\n\n"
-            yield "data: [END]\n\n"
-            return
-
-        try:
-            # --- 기존 로직 그대로, 단 triton 호출 부분만 model_name 인자로 수정 ---
+            # --- 기존 로직 그대로, 단 Triton 호출 부분만 model_name 인자로 사용 ---
             yield "data: [STEP 0] 질문 수신\n\n"
 
             # STEP 1: 게이트 (RAG / Chat 판단)
             t0 = time.time()
-            need_rag = decide_rag_needed(question, model_name=model_name) # 현재는 gating이 내부적으로 어떤 모델을 쓰든 크게 상관 없음
+            # 현재는 gating이 내부적으로 어떤 모델을 쓰든 크게 상관 없음
+            need_rag = decide_rag_needed(question, model_name=model_name)
             t1 = time.time()
             yield f"data: [STEP 1] 게이트={need_rag} (t={t1 - t0:.2f}s)\n\n"
 
@@ -174,39 +202,55 @@ async def query_stream(question: str, model: str = "gpt"):
             else:
                 yield "data: [STEP 2] 확장/검색 시작 (RAG, A/B 비교)\n\n"
 
-                # 2-1. 질의 확장 (한 번만)
-                expanded_text, kw_list = expand_query_kor(question)
-                yield f"data: [STEP 2] 확장 키워드={kw_list}\n\n"
+                # 🔹 여기서 전체 RAG A/B 비교 한 번에 수행
+                res_map = run_rag_ab_compare(
+                    query=question,
+                    with_llm=False,          # 여기서는 컨텍스트까지만, LLM은 아래에서 스트리밍
+                    model_name=model_name,
+                )
+                res_a = res_map["A"]
+                res_b = res_map["B"]
 
-                # ---------- A 스택 ----------
-                t2a = time.time()
-                try:
-                    hits_a = dense_retrieve_hybrid(qdr_a, emb_a, expanded_text, kw_list, COLLECTION)
-                    t3a = time.time()
-                    yield f"data: [STEP 3A] A스택 hits={len(hits_a)} (t={t3a - t2a:.2f}s)\n\n"
+                # 🔹 (공통) 확장 쿼리 / 키워드 로그
+                yield f"data: [EXPAND] 확장 쿼리(A기준) = {res_a.expanded_query}\n\n"
+                yield f"data: [EXPAND] 키워드(A기준) = {res_a.keywords}\n\n"
 
-                    if hits_a:
-                        yield "data: [STEP 4A] A스택 문맥 구성 시작\n\n"
-                        context_a, refs_a = build_context(hits_a)
-                    else:
-                        yield "data: [STEP 3A] A스택: 검색 결과 없음\n\n"
-                except Exception as e:
-                    yield f"data: [STEP 3A] A스택 검색 오류: {e}\n\n"
+                # 🔹 성능 타이밍을 SSE로 전송
+                ta = res_a.timings
+                tb = res_b.timings
 
-                # ---------- B 스택 ----------
-                t2b = time.time()
-                try:
-                    hits_b = dense_retrieve_hybrid(qdr_b, emb_b, expanded_text, kw_list, COLLECTION_B)
-                    t3b = time.time()
-                    yield f"data: [STEP 3B] B스택 hits={len(hits_b)} (t={t3b - t2b:.2f}s)\n\n"
+                yield (
+                    "data: [PERF-A] "
+                    f"확장(expand)={ta.get('expand_query', 0.0):.3f}s, "
+                    f"검색(dense_total)={ta.get('dense_search', 0.0):.3f}s, "
+                    f"리랭크(rerank)={ta.get('rerank', 0.0):.3f}s, "
+                    f"컨텍스트(ctx)={ta.get('build_context', 0.0):.3f}s\n\n"
+                )
+                yield (
+                    "data: [PERF-A] "
+                    f"확장(expand)={tb.get('expand_query', 0.0):.3f}s, "
+                    f"검색(dense_total)={tb.get('dense_search', 0.0):.3f}s, "
+                    f"리랭크(rerank)={tb.get('rerank', 0.0):.3f}s, "
+                    f"컨텍스트(ctx)={tb.get('build_context', 0.0):.3f}s\n\n"
+                )
 
-                    if hits_b:
-                        yield "data: [STEP 4B] B스택 문맥 구성 시작\n\n"
-                        context_b, refs_b = build_context(hits_b)
-                    else:
-                        yield "data: [STEP 3B] B스택: 검색 결과 없음\n\n"
-                except Exception as e:
-                    yield f"data: [STEP 3B] B스택 검색 오류: {e}\n\n"
+                # 🔹 상위 문서 목록도 SSE로 전송 (지금처럼)
+                yield "data: [HITS-A] ----- A 스택 상위 문서 목록 -----\n\n"
+                for i, h in enumerate(res_a.reranked_hits[:5], start=1):
+                    raw = (h.payload or {}).get("_node_text") or ""
+                    title = " ".join(str(raw).splitlines())
+                    yield f"data: [HITS-A] [{i}] {title}\n\n"
+
+                yield "data: [HITS-B] ----- B 스택 상위 문서 목록 -----\n\n"
+                for i, h in enumerate(res_b.reranked_hits[:5], start=1):
+                    raw = (h.payload or {}).get("_node_text") or ""
+                    title = " ".join(str(raw).splitlines())
+                    yield f"data: [HITS-B] [{i}] {title}\n\n"
+
+                # 🔹 아래 LLM 프롬프트 빌드 부분에서 context_a/context_b 에는
+                # res_a.context / res_b.context 을 그대로 사용
+                context_a, refs_a = res_a.context, res_a.refs
+                context_b, refs_b = res_b.context, res_b.refs
 
             # -------- 프롬프트 빌드 & 스트리밍 --------
 
@@ -219,7 +263,6 @@ async def query_stream(question: str, model: str = "gpt"):
                 user_msg = question
 
                 try:
-
                     messages = [
                         {"role": "system", "content": sys_msg},
                         {"role": "user", "content": user_msg},
@@ -253,7 +296,6 @@ async def query_stream(question: str, model: str = "gpt"):
                     "- 반드시 제공된 컨텍스트(문서 발췌)에서만 근거를 사용하세요.\n"
                     "- 컨텍스트에 없으면 '제공된 문서에서 찾지 못했습니다.'라고만 말하고, 임의로 추측하지 마세요.\n"
                     "- 한국어 문장에서 정상적인 띄어쓰기를 사용하세요.\n"
-                    "- 중요한 규칙: 최종 답변은 반드시 '<ANSWER>'로 시작해서 '</ANSWER>'로 끝납니다.\n"
                     "- 그 안쪽에만 실제 한국어 답변을 작성하고, 그 밖에는 어떤 분석/설명/계획 문장도 쓰지 마세요.\n"
                     "이 응답은 [A 스택] 검색 결과를 기반으로 합니다."
                 )
@@ -285,13 +327,6 @@ async def query_stream(question: str, model: str = "gpt"):
 [1] 논문 제목A
 [2] 논문 제목B
 [3] 논문 제목C
-
-위 지침을 반드시 따르되,
-최종 출력은 아래 형식을 **꼭 지키세요.**
-
-<ANSWER>
-(여기에만 한국어 최종 답변 작성)
-</ANSWER>
 """
 
                 try:
@@ -324,12 +359,11 @@ async def query_stream(question: str, model: str = "gpt"):
                     "- 반드시 제공된 컨텍스트(문서 발췌)에서만 근거를 사용하세요.\n"
                     "- 컨텍스트에 없으면 '제공된 문서에서 찾지 못했습니다.'라고만 말하고, 임의로 추측하지 마세요.\n"
                     "- 한국어 문장에서 정상적인 띄어쓰기를 사용하세요.\n"
-                    "- 중요한 규칙: 최종 답변은 반드시 '<ANSWER>'로 시작해서 '</ANSWER>'로 끝납니다.\n"
                     "- 그 안쪽에만 실제 한국어 답변을 작성하고, 그 밖에는 어떤 분석/설명/계획 문장도 쓰지 마세요.\n"
                     "이 응답은 [B 스택] 검색 결과를 기반으로 합니다."
                 )
                 user_msg_b = f"""
-다음은 [A 스택]에서 검색한 관련 문서 발췌입니다. 각 문단 앞의 번호는 출처 번호입니다.
+다음은 [B 스택]에서 검색한 관련 문서 발췌입니다. 각 문단 앞의 번호는 출처 번호입니다.
 
 [컨텍스트 발췌 시작]
 {context_b}
@@ -357,12 +391,6 @@ async def query_stream(question: str, model: str = "gpt"):
 [2] 논문 제목B
 [3] 논문 제목C
 
-위 지침을 반드시 따르되,
-최종 출력은 아래 형식을 **꼭 지키세요.**
-
-<ANSWER>
-(여기에만 한국어 최종 답변 작성)
-</ANSWER>
 """
 
                 try:

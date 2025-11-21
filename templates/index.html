@@ -176,13 +176,13 @@
   <!-- A / B 비교 영역 -->
   <div class="answer-grid">
     <div id="answer-a-card" class="card">
-      <h3>🅰 RAG-A 응답 (bge-m3 스택)</h3>
+      <h3>🅰 RAG-A 응답 (BAAI/bge-m3)</h3>
       <div id="answer-a" class="loading">
         듀얼 RAG 모드에서 A 스택 응답이 여기에 표시됩니다.
       </div>
     </div>
     <div id="answer-b-card" class="card">
-      <h3>🅱 RAG-B 응답 (e5 스택)</h3>
+      <h3>🅱 RAG-B 응답 (intfloat/multilingual-e5-large 스택)</h3>
       <div id="answer-b" class="loading">
         듀얼 RAG 모드에서 B 스택 응답이 여기에 표시됩니다.
       </div>
@@ -203,7 +203,7 @@
   const aDiv = document.getElementById("answer-a");
   const bDiv = document.getElementById("answer-b");
   const logBox = document.getElementById("stream-log");
-  const modelSelect = document.getElementById("modelSelect"); // 👈 추가
+  const modelSelect = document.getElementById("modelSelect");
 
   // ------------------------------
   // HTML 이스케이프
@@ -222,6 +222,12 @@
   function formatAnswer(rawText) {
     if (!rawText || !rawText.trim()) {
       return "<p>(빈 응답)</p>";
+    }
+
+    // 0) <ANSWER> ... </ANSWER> 안쪽만 사용
+    const answerMatch = rawText.match(/<ANSWER>([\s\S]*?)<\/ANSWER>/i);
+    if (answerMatch) {
+      rawText = answerMatch[1].trim();
     }
 
     // 1) "참고문헌" 기준으로 본문 / 참고문헌 분리
@@ -340,7 +346,7 @@
     const q = document.getElementById("question").value.trim();
     if (!q) return;
 
-    const modelKey = modelSelect.value; // 👈 선택된 모델 키 ("gpt" / "gemma" / "exaone")
+    const modelKey = modelSelect.value; // "gpt" / "gemma" / "exaone" ...
 
     // 초기화
     if (mainDiv) {
@@ -367,7 +373,6 @@
 
     if (window.eventSource) window.eventSource.close();
 
-    // 👇 서버에서 /query/stream 이 model, question 두 쿼리 파라미터를 받도록 맞추면 됨
     const url = "/query/stream"
         + "?model=" + encodeURIComponent(modelKey)
         + "&question=" + encodeURIComponent(q);
@@ -378,6 +383,7 @@
     es.onmessage = (ev) => {
       const line = ev.data;
 
+      // 종료 신호
       if (line === "[END]") {
         es.close();
 
@@ -400,21 +406,54 @@
           aDiv.textContent = "이번 질문은 RAG가 필요하지 않다고 판단되어 일반 Chat으로 처리되었습니다.";
           bDiv.textContent = "이번 질문은 RAG가 필요하지 않다고 판단되어 일반 Chat으로 처리되었습니다.";
         }
+        logBox.textContent += "[END]\n";
+        logBox.scrollTop = logBox.scrollHeight;
         return;
       }
 
+      // 모델 로드/상태
+      if (line.startsWith("[MODEL]")) {
+        logBox.textContent += line + "\n";
+        logBox.scrollTop = logBox.scrollHeight;
+        return;
+      }
+
+      if (line.startsWith("[EXPAND]")) {
+        logBox.textContent += line + "\n";
+        logBox.scrollTop = logBox.scrollHeight;
+        return;
+      }
+
+      // 단계 로그
       if (line.startsWith("[STEP")) {
         logBox.textContent += "🔹 " + line + "\n";
         logBox.scrollTop = logBox.scrollHeight;
         return;
       }
 
+
+      // RAG 구간 헤더/구분선
       if (line.includes("[RAG-A]") || line.includes("[RAG-B]") || line.startsWith("===")) {
         logBox.textContent += line + "\n";
         logBox.scrollTop = logBox.scrollHeight;
         return;
       }
 
+      // A/B 스택 임베딩 결과(문서 목록) 로그
+      if (line.startsWith("[HITS-A")) {
+        const text = line.replace(/^\[HITS-A\]\s?/, "");
+        logBox.textContent += "[HITS-A] " + text + "\n";
+        logBox.scrollTop = logBox.scrollHeight;
+        return;
+      }
+      if (line.startsWith("[HITS-B")) {
+        const text = line.replace(/^\[HITS-B\]\s?/, "");
+        logBox.textContent += "[HITS-B]" + text + "\n";
+        logBox.scrollTop = logBox.scrollHeight;
+        return;
+      }
+
+      // 에러
       if (line.startsWith("⚠️") || line.startsWith("ERR")) {
         logBox.textContent += "❗ " + line + "\n";
         logBox.scrollTop = logBox.scrollHeight;
@@ -423,7 +462,7 @@
 
       if (!line.trim()) return;
 
-      // A 스택
+      // A 스택 스트림
       if (line.startsWith("[A]")) {
         seenA = true;
         const text = line.replace(/^\[A\]\s?/, "");
@@ -435,10 +474,14 @@
         }
         aDiv.textContent += text;
         aDiv.scrollTop = aDiv.scrollHeight;
+
+        // 👇 로그에도 같이 남기기
+
+        logBox.scrollTop = logBox.scrollHeight;
         return;
       }
 
-      // B 스택
+      // B 스택 스트림
       if (line.startsWith("[B]")) {
         seenB = true;
         const text = line.replace(/^\[B\]\s?/, "");
@@ -450,11 +493,24 @@
         }
         bDiv.textContent += text;
         bDiv.scrollTop = bDiv.scrollHeight;
+
+        // 👇 로그에도 같이 남기기
+        logBox.scrollTop = logBox.scrollHeight;
         return;
       }
 
-      // 일반 CHAT 모드
+      // 성능 로그
+      if (line.startsWith("[PERF-")) {
+        logBox.textContent += line + "\n";
+        logBox.scrollTop = logBox.scrollHeight;
+        return;
+      }
+
+      // 일반 CHAT 모드 스트림 (RAG 사용 X)
       if (!seenA && !seenB && mainDiv) {
+        console.log(seenA)
+        console.log(seenB)
+        console.log(mainDiv)
         rawMain += line;
 
         if (mainDiv.textContent.startsWith("⏳") || mainDiv.classList.contains("loading")) {
@@ -464,10 +520,16 @@
         }
         mainDiv.textContent += line;
         mainDiv.scrollTop = mainDiv.scrollHeight;
-      } else {
+
+        // 👇 Chat 모드에서도 스트리밍 텍스트 로그에 같이 출력
         logBox.textContent += line + "\n";
         logBox.scrollTop = logBox.scrollHeight;
+        return;
       }
+
+      // 혹시 위 조건에 안 걸리는 라인들은 안전하게 로그로만 남김
+      logBox.textContent += line + "\n";
+      logBox.scrollTop = logBox.scrollHeight;
     };
 
     es.onerror = (err) => {
@@ -480,6 +542,7 @@
     };
   };
 </script>
+
 
 </body>
 </html>
