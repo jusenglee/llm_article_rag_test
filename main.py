@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import logging, nest_asyncio, time, traceback
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -14,9 +14,10 @@ from query_pipeline import (
     rrf_rerank,
     build_context,
     decide_rag_needed,
-    tokenizer,
     COLLECTION,
     COLLECTION_B,
+    ensure_single_model_loaded,  # 👈 query_pipeline에 추가
+    unload_model_safe, get_tokenizer_for_model,  # 👈 query_pipeline에 추가
 )
 
 # ---------------------------
@@ -35,30 +36,32 @@ templates = Jinja2Templates(directory="templates")
 qdr_a = emb_a = retriever_a = None
 qdr_b = emb_b = retriever_b = None
 
+# 클라이언트에서 오는 model 키 → Triton 모델 이름 매핑
+MODEL_MAP = {
+    "gpt": "gpt_oss_0",
+    "gemma": "gemma_vllm_0",
+    # EXAONE 붙이면 여기
+    # "exaone": "exaone4_32b",
+}
+
 
 @app.on_event("startup")
 async def init_rag():
     global qdr_a, emb_a, retriever_a, qdr_b, emb_b, retriever_b
     logger.info("🚀 Initializing RAG components (dual)...")
     qdr_a, emb_a, retriever_a, qdr_b, emb_b, retriever_b = build_rag_objects_dual()
-
-    # Warmup: GPU/토크나이저/JIT lazy init 비용 제거 (A 스택 기준)
-    try:
-        _ = tokenizer.encode("warmup")
-        _ = emb_a.get_text_embedding("warmup")
-    except Exception as e:
-        logger.info(f"Warmup skipped: {e}")
     logger.info("✅ RAG pipeline (A/B) ready.\n")
 
 
-async def triton_stream_async(prompt: str):
+async def triton_stream_async(model_name: str, prompt: str):
     """
     triton_infer(stream=True) 제너레이터를 비동기 SSE용으로 감싸는 래퍼
+    - 반드시 model_name을 인자로 받아서, 어떤 모델을 쓸지 FastAPI에서 결정
     """
     import asyncio
 
     loop = asyncio.get_event_loop()
-    gen = triton_infer(prompt, stream=True)
+    gen = triton_infer(model_name, prompt, stream=True)
 
     i = 0
     while True:
@@ -69,8 +72,6 @@ async def triton_stream_async(prompt: str):
 
         text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="ignore")
 
-        # 🔴 여기서 실제 토큰 단위 출력 확인
-        logger.info(f"[DEBUG] RAW_CHUNK[{i}]: {repr(text)}")
         i += 1
 
         yield text
@@ -88,18 +89,71 @@ async def home(request: Request):
 # SSE STREAM
 # ---------------------------
 @app.get("/query/stream")
-async def query_stream(question: str):
+async def query_stream(question: str, model: str = "gpt"):
+    """
+    클라이언트에서:
+      /query/stream?model=gpt&question=...
+    이런 식으로 호출 (HTML에서 select 박스로 model 값을 넘김)
 
+    전략:
+      1) model 키 → Triton 모델 이름 변환
+      2) ensure_single_model_loaded(model_name) 호출
+      3) RAG / Chat 프롬프트 생성 + triton_stream_async(model_name, ...)
+      4) 끝나면 finally에서 unload_model_safe(model_name)
+    """
+
+    model_key = model.lower()
+    if model_key not in MODEL_MAP:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {model}")
+
+    model_name = MODEL_MAP[model_key]
+    logger.info(f"[QUERY] model_key={model_key}, model_name={model_name}, question={question!r}")
+    tok = get_tokenizer_for_model(model_name)
     async def event_gen():
         import asyncio
 
+        # 여기서부터 이 요청 동안은 model_name 하나만 사용
+        await asyncio.sleep(0)  # 이벤트 루프 양보용
+
+        # 0. 한 번에 하나의 모델만 로드되도록 보장
         try:
+            logger.info(f"[TRITON] ensure_single_model_loaded({model_name})")
+            ensure_single_model_loaded(model_name)
+        except Exception as e:
+            err = f"ensure_single_model_loaded failed: {type(e).__name__}: {e}"
+            traceback.print_exc()
+            yield f"data: ⚠️ {err}\n\n"
+            yield "data: [END]\n\n"
+            return
+
+        try:
+            # 클라이언트 로그용 안내
+            yield f"data: [MODEL] 모델 로드 준비 (target={model_name})\n\n"
+
+            t0 = time.time()
+            logger.info(f"[TRITON] ensure_single_model_loaded({model_name})")
+            ensure_single_model_loaded(model_name)
+            t1 = time.time()
+
+            # 실제 로드 완료 알림
+            elapsed = t1 - t0
+            yield f"data: [MODEL] 모델 로드 완료 (active={model_name}, t={elapsed:.2f}s)\n\n"
+
+        except Exception as e:
+            err = f"ensure_single_model_loaded failed: {type(e).__name__}: {e}"
+            traceback.print_exc()
+            # 클라이언트에도 에러 표시
+            yield f"data: ⚠️ {err}\n\n"
+            yield "data: [END]\n\n"
+            return
+
+        try:
+            # --- 기존 로직 그대로, 단 triton 호출 부분만 model_name 인자로 수정 ---
             yield "data: [STEP 0] 질문 수신\n\n"
-            await asyncio.sleep(0)
 
             # STEP 1: 게이트 (RAG / Chat 판단)
             t0 = time.time()
-            need_rag = decide_rag_needed(question)
+            need_rag = decide_rag_needed(question, model_name=model_name) # 현재는 gating이 내부적으로 어떤 모델을 쓰든 크게 상관 없음
             t1 = time.time()
             yield f"data: [STEP 1] 게이트={need_rag} (t={t1 - t0:.2f}s)\n\n"
 
@@ -165,19 +219,20 @@ async def query_stream(question: str):
                 user_msg = question
 
                 try:
+
                     messages = [
                         {"role": "system", "content": sys_msg},
                         {"role": "user", "content": user_msg},
                     ]
-                    prompt = tokenizer.apply_chat_template(
+                    prompt = tok.apply_chat_template(
                         messages, tokenize=False, add_generation_prompt=True
                     )
                 except Exception:
                     prompt = f"<|system|>\n{sys_msg}\n<|user|>\n{user_msg}\n<|assistant|>\n"
 
-                yield "data: [STEP 5] LLM 스트리밍 시작 (일반 Chat)\n\n"
+                yield f"data: [STEP 5] LLM 스트리밍 시작 (일반 Chat, model={model_name})\n\n"
 
-                async for chunk in triton_stream_async(prompt):
+                async for chunk in triton_stream_async(model_name, prompt):
                     text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="ignore")
                     if text.strip():
                         yield f"data: {text}\n\n"
@@ -185,21 +240,22 @@ async def query_stream(question: str):
                 yield "data: [END]\n\n"
                 return
 
+            # ============================
             # 여기부터는 RAG A/B 비교 모드
+            # ============================
 
-            # ======================================
-            # A 스택 응답
-            # ======================================
+            # ---------- A 스택 응답 ----------
             if context_a:
                 ref_lines_a = "\n".join(refs_a) if refs_a else "(출처 정보 없음)"
-
 
                 sys_msg_a = (
                     "당신은 과학·기술 논문을 요약해서 한국어로 설명하는 전문 어시스턴트입니다.\n"
                     "- 반드시 제공된 컨텍스트(문서 발췌)에서만 근거를 사용하세요.\n"
                     "- 컨텍스트에 없으면 '제공된 문서에서 찾지 못했습니다.'라고만 말하고, 임의로 추측하지 마세요.\n"
-                    "- 한국어 문장에서 정상적인 띄어쓰기를 사용하고, 단어들을 공백 없이 붙여 쓰지 마세요.\n"
-                    "- 답변은 항상 ① 한 문단 요약 ② 번호가 있는 핵심 정리 목록 ③ '참고문헌' 섹션 순으로 작성하세요.\n"
+                    "- 한국어 문장에서 정상적인 띄어쓰기를 사용하세요.\n"
+                    "- 중요한 규칙: 최종 답변은 반드시 '<ANSWER>'로 시작해서 '</ANSWER>'로 끝납니다.\n"
+                    "- 그 안쪽에만 실제 한국어 답변을 작성하고, 그 밖에는 어떤 분석/설명/계획 문장도 쓰지 마세요.\n"
+                    "이 응답은 [A 스택] 검색 결과를 기반으로 합니다."
                 )
                 user_msg_a = f"""
 다음은 [A 스택]에서 검색한 관련 문서 발췌입니다. 각 문단 앞의 번호는 출처 번호입니다.
@@ -230,7 +286,12 @@ async def query_stream(question: str):
 [2] 논문 제목B
 [3] 논문 제목C
 
-위 형식을 최대한 정확하게 지키면서 답변하세요.
+위 지침을 반드시 따르되,
+최종 출력은 아래 형식을 **꼭 지키세요.**
+
+<ANSWER>
+(여기에만 한국어 최종 답변 작성)
+</ANSWER>
 """
 
                 try:
@@ -238,12 +299,7 @@ async def query_stream(question: str):
                         {"role": "system", "content": sys_msg_a},
                         {"role": "user", "content": user_msg_a},
                     ]
-
-                    logger.info("===== [DEBUG] PROMPT_A_HEAD =====")
-                    logger.info(messages_a[:400])
-                    logger.info("===== [DEBUG] PROMPT_A_TAIL =====")
-                    logger.info(messages_a[-400:])
-                    prompt_a = tokenizer.apply_chat_template(
+                    prompt_a = tok.apply_chat_template(
                         messages_a, tokenize=False, add_generation_prompt=True
                     )
                 except Exception:
@@ -254,35 +310,59 @@ async def query_stream(question: str):
                 yield "data: [RAG-A] 임베딩/벡터DB 스택 A 응답\n\n"
                 yield "data: =============================\n\n"
 
-                async for chunk in triton_stream_async(prompt_a):
+                async for chunk in triton_stream_async(model_name, prompt_a):
                     text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="ignore")
                     if text.strip():
                         yield f"data: [A] {text}\n\n"
 
-            # ======================================
-            # B 스택 응답
-            # ======================================
+            # ---------- B 스택 응답 ----------
             if context_b:
                 ref_lines_b = "\n".join(refs_b) if refs_b else "(출처 정보 없음)"
 
                 sys_msg_b = (
-                    "당신은 과학/기술 문서를 기반으로 답변하는 한국어 LLM입니다. "
-                    "반드시 제공된 컨텍스트에서만 근거를 사용하세요. "
+                    "당신은 과학·기술 논문을 요약해서 한국어로 설명하는 전문 어시스턴트입니다.\n"
+                    "- 반드시 제공된 컨텍스트(문서 발췌)에서만 근거를 사용하세요.\n"
+                    "- 컨텍스트에 없으면 '제공된 문서에서 찾지 못했습니다.'라고만 말하고, 임의로 추측하지 마세요.\n"
+                    "- 한국어 문장에서 정상적인 띄어쓰기를 사용하세요.\n"
+                    "- 중요한 규칙: 최종 답변은 반드시 '<ANSWER>'로 시작해서 '</ANSWER>'로 끝납니다.\n"
+                    "- 그 안쪽에만 실제 한국어 답변을 작성하고, 그 밖에는 어떤 분석/설명/계획 문장도 쓰지 마세요.\n"
                     "이 응답은 [B 스택] 검색 결과를 기반으로 합니다."
                 )
                 user_msg_b = f"""
-다음은 [B 스택]에서 검색한 관련 문서 발췌입니다(번호=출처):
+다음은 [A 스택]에서 검색한 관련 문서 발췌입니다. 각 문단 앞의 번호는 출처 번호입니다.
+
+[컨텍스트 발췌 시작]
 {context_b}
+[컨텍스트 발췌 끝]
 
 (출처 번호 매핑)
 {ref_lines_b}
 
-질문: {question}
+사용자의 질문:
+{question}
 
-요구사항:
-- 문장 내에 [1], [2] 형태로 근거 번호를 달아주세요.
-- 컨텍스트에 없는 내용은 쓰지 마세요(추가 지식 금지).
-- 마지막 줄에 '참고문헌:' 뒤에 논문 제목을 함께 나열하세요. 예시: 참고문헌: [1] 제목A, [2] 제목B
+답변 형식 가이드라인(아주 중요):
+1. 첫 문단에 2~3문장으로 전체 내용을 한국어로 요약합니다.
+2. 그 다음에는 "1. 소제목" 형식의 번호 매기기 목록으로 핵심 내용을 정리합니다.
+   - 각 항목은 "1. 소제목 [1][3]" 처럼 관련 출처 번호를 대괄호로 표기합니다.
+   - 소제목 아래 줄에서 2~4문장 정도로 설명을 덧붙입니다.
+3. 문장 중간에 근거를 달 때는 "…라는 점이 보고되었습니다[1][3]."처럼 [1] 형태의 인용 번호를 사용합니다.
+4. 한국어 문장 사이에는 일반적인 띄어쓰기를 유지하고,
+   '의학기술의최신동향은'처럼 단어를 모두 붙여 쓰지 말고
+   '의학 기술의 최신 동향은'처럼 자연스러운 띄어쓰기를 사용하세요.
+5. 마지막에는 아래 예시처럼 참고문헌 섹션을 추가합니다.
+
+참고문헌:
+[1] 논문 제목A
+[2] 논문 제목B
+[3] 논문 제목C
+
+위 지침을 반드시 따르되,
+최종 출력은 아래 형식을 **꼭 지키세요.**
+
+<ANSWER>
+(여기에만 한국어 최종 답변 작성)
+</ANSWER>
 """
 
                 try:
@@ -290,12 +370,7 @@ async def query_stream(question: str):
                         {"role": "system", "content": sys_msg_b},
                         {"role": "user", "content": user_msg_b},
                     ]
-
-                    logger.info("===== [DEBUG] PROMPT_B_HEAD =====")
-                    logger.info(messages_b[:400])
-                    logger.info("===== [DEBUG] PROMPT_B_TAIL =====")
-                    logger.info(messages_b[-400:])
-                    prompt_b = tokenizer.apply_chat_template(
+                    prompt_b = tok.apply_chat_template(
                         messages_b, tokenize=False, add_generation_prompt=True
                     )
                 except Exception:
@@ -306,7 +381,7 @@ async def query_stream(question: str):
                 yield "data: [RAG-B] 임베딩/벡터DB 스택 B 응답\n\n"
                 yield "data: =============================\n\n"
 
-                async for chunk in triton_stream_async(prompt_b):
+                async for chunk in triton_stream_async(model_name, prompt_b):
                     text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="ignore")
                     if text.strip():
                         yield f"data: [B] {text}\n\n"
@@ -319,6 +394,14 @@ async def query_stream(question: str):
             traceback.print_exc()
             yield f"data: ⚠️ 오류: {err}\n\n"
             yield "data: [END]\n\n"
+
+        finally:
+            # 이 요청에서 사용한 모델은 무조건 내려준다 (한 번에 하나 전략)
+            try:
+                logger.info(f"[TRITON] unload_model_safe({model_name})")
+                unload_model_safe(model_name)
+            except Exception as e:
+                logger.warning(f"[TRITON] unload_model_safe({model_name}) failed: {e}")
 
     return StreamingResponse(
         event_gen(),

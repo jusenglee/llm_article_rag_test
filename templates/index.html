@@ -117,6 +117,26 @@
       font-size: 14px;
       color: #666;
     }
+
+    /* 👇 모델 선택 영역 스타일 (살짝만) */
+    .model-row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 14px;
+    }
+    .model-row label {
+      font-weight: 600;
+      color: #444;
+      min-width: 80px;
+    }
+    .model-row select {
+      flex: 1;
+      padding: 6px 8px;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      font-size: 14px;
+    }
   </style>
 </head>
 <body>
@@ -124,13 +144,27 @@
 <h2>🔍 연구 논문 질의응답 (듀얼 임베딩 비교)</h2>
 
 <form id="qform">
+  <!-- 👇 모델 선택 셀렉트 박스 추가 -->
+  <div class="model-row">
+    <label for="modelSelect">모델 선택</label>
+    <select id="modelSelect" name="model">
+      <!-- value 값은 서버에서 사용하는 키(gpt/gemma/exaone)로 맞춰두고,
+           FastAPI에서 MODEL_MAP 으로 Triton 모델 이름으로 매핑하면 됨 -->
+      <option value="gpt">GPT-OSS (gpt_oss_0)</option>
+      <option value="gemma">Gemma vLLM (gemma_vllm_0)</option>
+      <!-- EXAONE 붙이면 여기 활성화
+      <option value="exaone">EXAONE-4.0 32B</option>
+      -->
+    </select>
+  </div>
+
   <textarea name="question" id="question" placeholder="질문을 입력하세요..." rows="3"></textarea>
   <button type="submit">질의</button>
 </form>
 
 <div class="answers-wrapper">
 
-  <!-- ↓↓↓ CHAT 모드 전용 메인 응답 카드 추가 ↓↓↓ -->
+  <!-- ↓↓↓ CHAT 모드 전용 메인 응답 카드 ↓↓↓ -->
   <div id="answer-main-card" class="card" style="display:none;">
     <h3>💬 Chat 모드 응답</h3>
     <div id="answer-main" class="loading">
@@ -169,6 +203,7 @@
   const aDiv = document.getElementById("answer-a");
   const bDiv = document.getElementById("answer-b");
   const logBox = document.getElementById("stream-log");
+  const modelSelect = document.getElementById("modelSelect"); // 👈 추가
 
   // ------------------------------
   // HTML 이스케이프
@@ -183,9 +218,6 @@
 
   // ------------------------------
   // 모델 응답 보기 좋게 포맷팅
-  //  - case A: * 로 나뉜 bullet 스타일
-  //  - case B: "1. 제목 ..." 번호 리스트 스타일
-  //  + 참고문헌 섹션 분리
   // ------------------------------
   function formatAnswer(rawText) {
     if (!rawText || !rawText.trim()) {
@@ -206,9 +238,7 @@
 
     let html = "";
 
-    // -------------------------------------------------
-    // 2) case A: '*' 로 구분된 bullet 스타일
-    // -------------------------------------------------
+    // case A: '*' bullet
     if (body.includes("*")) {
       const parts = body.split("*");
       const intro = parts[0].trim();
@@ -231,11 +261,7 @@
       }
 
     } else {
-      // -------------------------------------------------
-      // 3) case B: "1. 제목 ..." 번호 리스트 스타일
-      // -------------------------------------------------
-
-      // 숫자. 패턴 앞에 줄바꿈 넣어서 토막으로 만들기 쉽게
+      // case B: "1. 제목 ..." 번호 리스트 스타일
       let normalized = body.replace(/(\d+)\.\s*/g, "\n$1. ");
 
       const lines = normalized.split(/\n+/);
@@ -249,27 +275,22 @@
 
         const m = line.match(/^(\d+)\.\s*(.*)$/);
         if (m) {
-          // 새 번호 항목 시작
           if (current) items.push(current);
 
           const num = m[1];
           let title = m[2].trim();
 
-          // "1."만 있고 제목이 없으면, 다음 줄을 제목으로 사용
           if (!title && i + 1 < lines.length) {
             const next = lines[i + 1].trim();
             if (next) {
               title = next;
-              i++; // 제목으로 사용했으니 한 줄 건너뛴다
+              i++;
             }
           }
 
-          // 제목 끝이 콜론이면 제거
           title = title.replace(/:$/, "");
-
           current = { num, title, body: "" };
         } else {
-          // 일반 텍스트 라인
           if (!current) {
             introLines.push(line);
           } else {
@@ -279,12 +300,10 @@
       }
       if (current) items.push(current);
 
-      // 인트로 문단
       if (introLines.length > 0) {
         html += `<p>${escapeHtml(introLines.join(" "))}</p>`;
       }
 
-      // 번호 리스트 렌더링
       if (items.length > 0) {
         html += "<ol>";
         for (const it of items) {
@@ -302,12 +321,9 @@
       }
     }
 
-    // -------------------------------------------------
-    // 4) 참고문헌 섹션 (공통)
-    // -------------------------------------------------
+    // 4) 참고문헌 섹션
     if (refs) {
       let refsEscaped = escapeHtml(refs);
-      // [1], [2] 같은 번호는 굵게
       refsEscaped = refsEscaped.replace(/\[(\d+)\]/g, '<strong>[$1]</strong>');
       html += `<h4 style="margin-top:20px;">참고문헌</h4>`;
       html += `<p style="font-size:14px; color:#555; white-space:pre-line;">${refsEscaped}</p>`;
@@ -323,6 +339,8 @@
     e.preventDefault();
     const q = document.getElementById("question").value.trim();
     if (!q) return;
+
+    const modelKey = modelSelect.value; // 👈 선택된 모델 키 ("gpt" / "gemma" / "exaone")
 
     // 초기화
     if (mainDiv) {
@@ -349,18 +367,20 @@
 
     if (window.eventSource) window.eventSource.close();
 
-    const url = "/query/stream?question=" + encodeURIComponent(q);
+    // 👇 서버에서 /query/stream 이 model, question 두 쿼리 파라미터를 받도록 맞추면 됨
+    const url = "/query/stream"
+        + "?model=" + encodeURIComponent(modelKey)
+        + "&question=" + encodeURIComponent(q);
+
     const es = new EventSource(url);
     window.eventSource = es;
 
     es.onmessage = (ev) => {
       const line = ev.data;
 
-      // 종료 처리
       if (line === "[END]") {
         es.close();
 
-        // A/B 응답 포맷팅
         if (seenA) {
           aDiv.classList.remove("loading");
           aDiv.innerHTML = rawA ? formatAnswer(rawA) : "(A 스택에서 유효한 응답이 없습니다)";
@@ -370,13 +390,11 @@
           bDiv.innerHTML = rawB ? formatAnswer(rawB) : "(B 스택에서 유효한 응답이 없습니다)";
         }
 
-        // 듀얼 RAG가 아닌 경우 → 메인 응답만 포맷팅 (CHAT 모드)
         if (!seenA && !seenB && mainDiv) {
           mainDiv.classList.remove("loading");
           mainDiv.innerHTML = formatAnswer(rawMain || "(빈 응답)");
           mainCard.style.display = "block";
 
-          // RAG 카드에는 안내 문구만
           aDiv.classList.remove("loading");
           bDiv.classList.remove("loading");
           aDiv.textContent = "이번 질문은 RAG가 필요하지 않다고 판단되어 일반 Chat으로 처리되었습니다.";
@@ -385,21 +403,18 @@
         return;
       }
 
-      // STEP 로그
       if (line.startsWith("[STEP")) {
         logBox.textContent += "🔹 " + line + "\n";
         logBox.scrollTop = logBox.scrollHeight;
         return;
       }
 
-      // RAG-A / RAG-B 헤더 / 구분선
       if (line.includes("[RAG-A]") || line.includes("[RAG-B]") || line.startsWith("===")) {
         logBox.textContent += line + "\n";
         logBox.scrollTop = logBox.scrollHeight;
         return;
       }
 
-      // 경고/오류
       if (line.startsWith("⚠️") || line.startsWith("ERR")) {
         logBox.textContent += "❗ " + line + "\n";
         logBox.scrollTop = logBox.scrollHeight;
@@ -408,14 +423,10 @@
 
       if (!line.trim()) return;
 
-      // -------------------------
-      // 🤖 LLM 토큰 스트리밍
-      // -------------------------
-
-      // A 스택 토큰
+      // A 스택
       if (line.startsWith("[A]")) {
         seenA = true;
-        const text = line.replace(/^\[A\]\s?/, ""); // [A] 제거
+        const text = line.replace(/^\[A\]\s?/, "");
         rawA += text;
 
         if (aDiv.textContent.startsWith("⏳")) {
@@ -427,10 +438,10 @@
         return;
       }
 
-      // B 스택 토큰
+      // B 스택
       if (line.startsWith("[B]")) {
         seenB = true;
-        const text = line.replace(/^\[B\]\s?/, ""); // [B] 제거
+        const text = line.replace(/^\[B\]\s?/, "");
         rawB += text;
 
         if (bDiv.textContent.startsWith("⏳")) {
@@ -442,10 +453,7 @@
         return;
       }
 
-      // -------------------------
-      // 일반 CHAT 모드 토큰
-      // (A/B 태그가 없고, 아직 RAG-A/B 응답이 시작되지 않은 경우)
-      // -------------------------
+      // 일반 CHAT 모드
       if (!seenA && !seenB && mainDiv) {
         rawMain += line;
 
@@ -457,7 +465,6 @@
         mainDiv.textContent += line;
         mainDiv.scrollTop = mainDiv.scrollHeight;
       } else {
-        // 혹시 모를 이상 토큰은 로그에만 남김
         logBox.textContent += line + "\n";
         logBox.scrollTop = logBox.scrollHeight;
       }

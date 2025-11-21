@@ -21,7 +21,7 @@ from llama_index.core import StorageContext, VectorStoreIndex
 from transformers import AutoTokenizer
 from tritonclient.grpc import InferenceServerClient, InferInput, InferRequestedOutput
 from rapidfuzz import fuzz
-
+from dataclasses import dataclass
 # 로깅 설정
 logger = logging.getLogger("uvicorn.error")
 if not logger.handlers:
@@ -36,9 +36,12 @@ QDRANT_PORT  = int(os.getenv("QDRANT_PORT", 6334))  # GRPC Port
 COLLECTION   = os.getenv("QDRANT_COLLECTION", "peS2o_rag")
 EMBED_MODEL  = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 
-TRITON_URL   = os.getenv("TRITON_URL", "211.241.177.73:8001")
-MODEL_NAME   = os.getenv("TRITON_MODEL", "gemma_vllm_0")
-TOKENIZER_ID = os.getenv("TOKENIZER_ID", "./data/")  # 로컬 경로 혹은 모델명
+TRITON_URL        = os.getenv("TRITON_URL", "211.241.177.73:8001")
+DEFAULT_MODEL_NAME = os.getenv("TRITON_MODEL", "gpt_oss_0")  # 기본 LLM 이름
+TOKENIZER_MAP = {
+    "gpt_oss_0": "openai/gpt-oss-20b",      # gpt-oss용 경로/HF ID
+    "gemma_vllm_0": "./data/gemma3",    # 지금 사용하던 Gemma3 토커나이저
+}
 
 # === B 스택용 설정 (두 번째 임베딩 + 벡터DB) ===
 QDRANT_HOST_B  = os.getenv("QDRANT_HOST_B", QDRANT_HOST)
@@ -59,6 +62,19 @@ FUZZ_MIN        = 40
 CTX_TOKEN_BUDGET = 4096
 SNIPPET_MAX_CHARS = 4096
 
+
+@dataclass
+class RagResult:
+    stack: str            # "A" or "B"
+    expanded_query: str
+    keywords: List[str]
+    hits: Any             # Qdrant 결과 (points)
+    reranked_hits: Any
+    context: str
+    refs: List[str]
+    timings: Dict[str, float]
+    llm_answer: str | None = None
+
 # ---------------------------
 # 전역 리소스 캐시
 # ---------------------------
@@ -66,22 +82,33 @@ _qdr, _emb, _retriever = None, None, None        # A 스택
 _qdr2, _emb2, _retriever2 = None, None, None     # B 스택
 _triton_client = None
 
-# Tokenizer 로드
-try:
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID, trust_remote_code=True)
-except Exception:
-    logger.warning(f"[WARN] 지정된 토크나이저({TOKENIZER_ID}) 로드 실패. gpt2로 대체합니다.")
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+_tokenizers: Dict[str, AutoTokenizer] = {}
 
+def get_tokenizer_for_model(model_name: str) -> AutoTokenizer:
+    if model_name not in _tokenizers:
+        tok_id = TOKENIZER_MAP[model_name]
+        _tokenizers[model_name] = AutoTokenizer.from_pretrained(
+            tok_id, trust_remote_code=True
+        )
+    return _tokenizers[model_name]
 
-def log_prompt_token_stats(prompt: str, name: str = "prompt"):
-    try:
-        tokens = tokenizer.encode(prompt)
-        logger.info(f"[TOKENS] {name}: {len(tokens)} tokens")
-    except Exception as e:
-        logger.warning(f"[TOKENS] {name}: calculation error: {e}")
+ASSISTANT_FINAL_MARKER = "assistantfinal"
+def extract_final_answer(raw: str) -> str:
+    """gpt-oss가 analysis/assistantfinal 포맷으로 뱉을 때, 최종 답변만 추출."""
+    if not raw:
+        return ""
 
+    text = str(raw).strip()
+    idx = text.rfind(ASSISTANT_FINAL_MARKER)
+    if idx == -1:
+        # 마커 없으면 그냥 원본 반환 (다른 모델 대비 안전장치)
+        return text
 
+    final = text[idx + len(ASSISTANT_FINAL_MARKER):]
+    # 콜론/공백 정리
+    final = final.lstrip(" :\n\t")
+    logger.info(final)
+    return final.strip()
 # ---------------------------
 # Triton Client & LLM Core
 # ---------------------------
@@ -128,6 +155,7 @@ def _make_inputs(
 
 
 def _triton_stream_generator(
+        model_name: str,
         prompt: str,
         text: InferInput,
         sparams: InferInput,
@@ -153,17 +181,15 @@ def _triton_stream_generator(
             done.set()
             return
 
-        # 1) raw bytes 꺼내기
         arr = result.as_numpy("text_output")
         if arr is not None and len(arr) > 0:
             raw = arr[0]
             chunk = raw.decode("utf-8", errors="ignore")
             q.append(chunk)
 
-        # 2) final response 여부 확인
         is_final = False
         try:
-            resp = result.get_response()  # ModelInferResponse(proto)
+            resp = result.get_response()
             params = getattr(resp, "parameters", None)
             if params:
                 flag = params.get("triton_final_response")
@@ -178,9 +204,8 @@ def _triton_stream_generator(
 
     # 스트림 시작
     cli.start_stream(callback=on_resp)
-    cli.async_stream_infer(MODEL_NAME, inputs=[text, sparams, stream_flag], outputs=outs)
+    cli.async_stream_infer(model_name, inputs=[text, sparams, stream_flag], outputs=outs)
 
-    # 스트리밍 루프
     try:
         start_time = time.time()
         last_yield_time = start_time
@@ -194,11 +219,9 @@ def _triton_stream_generator(
                 yield chunk
             else:
                 now = time.time()
-                # 첫 토큰 대기 타임아웃
                 if not got_first and (now - start_time > first_token_timeout):
                     logger.warning("[WARN] First token timeout")
                     break
-                # 응답 도중 idle timeout
                 if got_first and (now - last_yield_time > idle_timeout):
                     logger.warning("[WARN] Idle timeout after response started")
                     break
@@ -208,6 +231,7 @@ def _triton_stream_generator(
 
 
 def _triton_infer_sync(
+        model_name: str,
         prompt: str,
         *,
         max_tokens: int,
@@ -220,15 +244,14 @@ def _triton_infer_sync(
     )
 
     accumulated_text = ""
-
-    # 제너레이터 소비
-    for chunk in _triton_stream_generator(prompt, text, sparams, 10, 20):
+    for chunk in _triton_stream_generator(model_name, prompt, text, sparams, 10, 20):
         accumulated_text += chunk
 
     return accumulated_text.strip()
 
 
 def triton_infer(
+        model_name: str,
         prompt: str,
         *,
         stream: bool = True,
@@ -238,21 +261,89 @@ def triton_infer(
         timeout_first: int = 20,
         timeout_idle: int = 120,
 ):
+    logger.info(f"[TRITON] infer start - model={model_name}, len={len(prompt)}")
 
     if stream:
         text, sparams = _make_inputs(
             prompt, max_tokens=max_tokens,
             temperature=temperature, top_p=top_p, stream=True
         )
-        return _triton_stream_generator(prompt, text, sparams, timeout_first, timeout_idle)
+        return _triton_stream_generator(
+            model_name, prompt, text, sparams,
+            timeout_first, timeout_idle
+        )
 
     # Sync Path
     return _triton_infer_sync(
-        prompt, max_tokens=max_tokens, temperature=temperature,
-        top_p=top_p
+        model_name,
+        prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
     )
 
+def ensure_single_model_loaded(target_model: str, timeout: float = 120.0) -> None:
+    """
+    1) 레포지토리 인덱스를 보고 target 이외 모델은 모두 unload
+    2) target 모델이 READY 상태가 아니면 load + READY 될 때까지 대기
+    """
+    cli = get_triton_client()
 
+    # 1. 모델 레포지토리 인덱스 조회
+    try:
+        repo = cli.get_model_repository_index()
+    except Exception as e:
+        logger.error(f"[TRITON] get_model_repository_index failed: {e}")
+        raise
+
+    # 2. target 외 모델 unload
+    for m in getattr(repo, "models", []):
+        name = getattr(m, "name", None)
+        if not name or name == target_model:
+            continue
+        try:
+            if cli.is_model_ready(name):
+                logger.info(f"[TRITON] unloading other model: {name}")
+                cli.unload_model(name)
+        except Exception as e:
+            logger.warning(f"[TRITON] unload_model({name}) failed: {e}")
+
+    # 3. target 이 이미 READY면 바로 리턴
+    try:
+        if cli.is_model_ready(target_model):
+            logger.info(f"[TRITON] target model {target_model} already READY")
+            return
+    except Exception as e:
+        logger.warning(f"[TRITON] is_model_ready({target_model}) error: {e}")
+
+    # 4. target load
+    logger.info(f"[TRITON] loading model: {target_model}")
+    cli.load_model(target_model)
+
+    # 5. READY 될 때까지 polling
+    start = time.time()
+    while True:
+        try:
+            if cli.is_model_ready(target_model):
+                logger.info(f"[TRITON] model {target_model} READY")
+                return
+        except Exception as e:
+            logger.warning(f"[TRITON] is_model_ready({target_model}) check failed: {e}")
+
+        if time.time() - start > timeout:
+            raise TimeoutError(f"Timeout while waiting for model {target_model} to be READY")
+
+        time.sleep(0.5)
+
+
+def unload_model_safe(model_name: str) -> None:
+    cli = get_triton_client()
+    try:
+        if cli.is_model_ready(model_name):
+            logger.info(f"[TRITON] unloading model: {model_name}")
+            cli.unload_model(model_name)
+    except Exception as e:
+        logger.warning(f"[TRITON] unload_model({model_name}) failed: {e}")
 # ---------------------------
 # RAG Utils & Objects
 # ---------------------------
@@ -371,9 +462,15 @@ Respond ONLY with a JSON array of 8 concise English keywords.
 Input: {query}
 Output: """
 
-    resp = triton_infer(
-        prompt, stream=False, max_tokens=64, temperature=0.3
+    raw = triton_infer(
+        DEFAULT_MODEL_NAME,
+        prompt,
+        stream=False,
+        max_tokens=64,
+        temperature=0.3,
     )
+
+    resp = extract_final_answer(raw)  # 🔴 CoT 제거
 
     try:
         # JSON 파싱 시도 (배열 찾기)
@@ -501,13 +598,155 @@ def build_context(hits):
 # Main Logic (Gating & Execution)
 # ---------------------------
 
-def decide_rag_needed(query: str) -> bool:
-    # 간단한 규칙 기반 필터링 우선
+def decide_rag_needed(query: str, model_name: str = DEFAULT_MODEL_NAME) -> bool:
     casual = ["안녕", "날씨", "이름", "뭐해", "반가워"]
     if any(c in query for c in casual):
         return False
 
-    # LLM 판단
-    prompt = f"Is this query asking for factual knowledge? (YES/NO)\nQuery: {query}\nAnswer:"
-    resp = triton_infer(prompt, stream=False, max_tokens=10)
-    return "yes" in resp.lower()
+    prompt = (
+        "You are a classifier.\n"
+        "Decide if the user query requires external factual knowledge "
+        "such as scientific, technical, or domain-specific information.\n"
+        "If YES, answer exactly 'YES'. If NO, answer exactly 'NO'.\n"
+        f"Query: {query}\n"
+        "Answer (YES or NO only):"
+    )
+
+    raw = triton_infer(model_name, prompt, stream=False, max_tokens=4)
+    resp = extract_final_answer(raw).strip().upper()
+    if "YES" in resp:
+        return True
+    if "NO" in resp:
+        return False
+
+    # 애매하면 보수적으로 RAG 사용
+    return True
+
+def run_rag_once(
+        query: str,
+        stack: str = "A",
+        with_llm: bool = True,
+        model_name: str = DEFAULT_MODEL_NAME,
+) -> RagResult:
+    """
+    하나의 스택(A/B)에 대해:
+    - 쿼리 확장
+    - 임베딩 + Qdrant 검색
+    - 리랭킹
+    - 컨텍스트 빌드
+    - (옵션) LLM 답변 생성
+    전 과정을 실행하고, 타이밍/결과를 모두 담아 반환.
+    """
+    t_all0 = time.time()
+    timings: Dict[str, float] = {}
+
+    # 1) 스택별 객체 준비
+    t0 = time.time()
+    if stack == "A":
+        qdr, emb, retriever, _, _, _ = build_rag_objects_dual()
+        collection = COLLECTION
+    else:
+        qdr, emb, retriever, qdr2, emb2, retriever2 = build_rag_objects_dual()
+        qdr, emb, retriever = qdr2, emb2, retriever2
+        collection = COLLECTION_B
+    timings["stack_init"] = time.time() - t0
+
+    # 2) 쿼리 확장
+    t0 = time.time()
+    expanded_query, kws = expand_query_kor(query)
+    timings["expand_query"] = time.time() - t0
+
+    # 3) dense 검색
+    t0 = time.time()
+    hits = dense_retrieve_hybrid(
+        client=qdr,
+        emb=emb,
+        expanded_text=expanded_query,
+        keywords=kws,
+        collection_name=collection,
+    )
+    timings["dense_search"] = time.time() - t0
+
+    # 4) 리랭킹
+    t0 = time.time()
+    reranked = rrf_rerank(hits, kws)
+    timings["rerank"] = time.time() - t0
+
+    # 5) 컨텍스트 빌드
+    t0 = time.time()
+    context, refs = build_context(reranked)
+    timings["build_context"] = time.time() - t0
+
+    # 6) LLM 답변 생성 (선택)
+    llm_answer = None
+    if with_llm:
+        t0 = time.time()
+        prompt = (
+            "당신은 과학/기술 문서를 기반으로 답변하는 한국어 LLM입니다.\n"
+            "반드시 제공된 컨텍스트에서만 근거를 사용하세요.\n"
+            "컨텍스트에 없으면 '제공된 문서에서 찾지 못했습니다'라고만 말하고, 추측하지 마세요.\n\n"
+            f"[질문]\n{query}\n\n[컨텍스트]\n{context}\n"
+        )
+        raw = triton_infer(model_name, prompt, stream=False, max_tokens=1024)
+        llm_answer = extract_final_answer(raw)
+        timings["llm_answer"] = time.time() - t0
+
+    timings["total"] = time.time() - t_all0
+
+    return RagResult(
+        stack=stack,
+        expanded_query=expanded_query,
+        keywords=kws,
+        hits=hits,
+        reranked_hits=reranked,
+        context=context,
+        refs=refs,
+        timings=timings,
+        llm_answer=llm_answer,
+    )
+
+def run_rag_ab_compare(
+        query: str,
+        with_llm: bool = True,
+        model_name: str = DEFAULT_MODEL_NAME,
+) -> Dict[str, RagResult]:
+    """
+    같은 질문에 대해 A/B 스택을 모두 실행.
+    레포트/로그/오프라인 분석에 쓰기 좋게 dict로 리턴.
+    """
+    res_a = run_rag_once(query, stack="A", with_llm=with_llm, model_name=model_name)
+    res_b = run_rag_once(query, stack="B", with_llm=with_llm, model_name=model_name)
+
+    return {"A": res_a, "B": res_b}
+
+
+import pathlib
+
+LOG_DIR = pathlib.Path(os.getenv("RAG_BENCH_LOG_DIR", "./rag_bench_logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def log_ab_result_to_file(query: str, res_map: Dict[str, RagResult]):
+    ts = int(time.time())
+    for key, res in res_map.items():
+        out = {
+            "timestamp": ts,
+            "stack": res.stack,           # "A" or "B"
+            "embedding_model": EMBED_MODEL if res.stack == "A" else EMBED_MODEL_B,
+            "query": query,
+            "expanded_query": res.expanded_query,
+            "keywords": res.keywords,
+            "timings": res.timings,
+            "refs": res.refs,
+            "llm_answer": res.llm_answer,
+            "top_hits": [
+                {
+                    "id": h.id,
+                    "score": float(h.score) if h.score is not None else 0.0,
+                    "payload_doc_id": (h.payload or {}).get("doc_id") or (h.payload or {}).get("paper_id"),
+                }
+                for h in res.reranked_hits[:TOP_K_RETURN]
+            ],
+        }
+        fname = LOG_DIR / f"{ts}_{res.stack}.jsonl"
+        with open(fname, "a", encoding="utf-8") as f:
+            f.write(json.dumps(out, ensure_ascii=False) + "\n")
