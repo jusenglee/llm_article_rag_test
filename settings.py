@@ -26,12 +26,13 @@ TRITON_URL         = os.getenv("TRITON_URL", "211.241.177.73:8001")
 DEFAULT_MODEL_NAME = os.getenv("TRITON_MODEL", "gpt_oss_0")
 TOKENIZER_MAP = {
     "gpt_oss_0": "openai/gpt-oss-20b",
-    "gemma_vllm_0": "./data/gemma3",
+    "gemma_vllm_0": "./data/gemma_vllm_0",
+    "EXAONE_0": "./data/EXAONE_0",
 }
 
 # 하이퍼파라미터
 TOP_K_BASE       = 50
-TOP_K_RETURN     = 5
+TOP_K_RETURN     = 20
 MAX_TOKENS       = 8192
 TEMPERATURE      = 0.6
 TOP_P            = 0.9

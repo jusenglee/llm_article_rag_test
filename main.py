@@ -34,7 +34,7 @@ MODEL_MAP = {
     "gpt": "gpt_oss_0",
     "gemma": "gemma_vllm_0",
     # EXAONE 붙이면 여기
-    # "exaone": "exaone4_32b",
+     "exaone": "EXAONE_0",
 }
 
 
@@ -88,11 +88,10 @@ async def query_stream(question: str, model: str = "gpt"):
       /query/stream?model=gpt&question=...
     이런 식으로 호출 (HTML에서 select 박스로 model 값을 넘김)
 
-    전략:
-      1) model 키 → Triton 모델 이름 변환
-      2) ensure_single_model_loaded(model_name) 호출
-      3) RAG / Chat 프롬프트 생성 + triton_stream_async(model_name, ...)
-      4) 끝나면 finally에서 unload_model_safe(model_name)
+    1) model 키 → Triton 모델 이름 변환
+    2) ensure_single_model_loaded(model_name) 호출
+    3) RAG / Chat 프롬프트 생성 + triton_stream_async(model_name, ...)
+    4) 끝나면 finally에서 unload_model_safe(model_name)
     """
 
     model_key = model.lower()
@@ -175,17 +174,15 @@ async def query_stream(question: str, model: str = "gpt"):
             return
 
         try:
-            # --- 기존 로직 그대로, 단 Triton 호출 부분만 model_name 인자로 사용 ---
             yield "data: [STEP 0] 질문 수신\n\n"
 
-            # STEP 1: 게이트 (RAG / Chat 판단)
+            # 1: 게이트 (RAG / Chat 판단)
             t0 = time.time()
-            # 현재는 gating이 내부적으로 어떤 모델을 쓰든 크게 상관 없음
             need_rag = decide_rag_needed(question, model_name=model_name)
             t1 = time.time()
             yield f"data: [STEP 1] 게이트={need_rag} (t={t1 - t0:.2f}s)\n\n"
 
-            # 공통: 질의 확장은 한 번만
+            # 질의 확장은 한 번만
             expanded_text = None
             kw_list = None
 
@@ -195,14 +192,14 @@ async def query_stream(question: str, model: str = "gpt"):
             context_b = ""
             refs_b = []
 
-            # --- RAG or Chat 분기 ---
+            # RAG or Chat 분기
             if not need_rag:
                 # 순수 Chat 모드
                 yield "data: [STEP 2] RAG 스킵 → 일반 대화 진행\n\n"
             else:
                 yield "data: [STEP 2] 확장/검색 시작 (RAG, A/B 비교)\n\n"
 
-                # 🔹 여기서 전체 RAG A/B 비교 한 번에 수행
+                # 여기서 전체 RAG A/B 비교 한 번에 수행
                 res_map = run_rag_ab_compare(
                     query=question,
                     with_llm=False,          # 여기서는 컨텍스트까지만, LLM은 아래에서 스트리밍
@@ -211,11 +208,11 @@ async def query_stream(question: str, model: str = "gpt"):
                 res_a = res_map["A"]
                 res_b = res_map["B"]
 
-                # 🔹 (공통) 확장 쿼리 / 키워드 로그
+                # 확장 쿼리 / 키워드 로그
                 yield f"data: [EXPAND] 확장 쿼리(A기준) = {res_a.expanded_query}\n\n"
                 yield f"data: [EXPAND] 키워드(A기준) = {res_a.keywords}\n\n"
 
-                # 🔹 성능 타이밍을 SSE로 전송
+                # 성능 타이밍을 SSE로 전송
                 ta = res_a.timings
                 tb = res_b.timings
 
@@ -234,7 +231,7 @@ async def query_stream(question: str, model: str = "gpt"):
                     f"컨텍스트(ctx)={tb.get('build_context', 0.0):.3f}s\n\n"
                 )
 
-                # 🔹 상위 문서 목록도 SSE로 전송 (지금처럼)
+                # 상위 문서 목록도 SSE로 전송
                 yield "data: [HITS-A] ----- A 스택 상위 문서 목록 -----\n\n"
                 for i, h in enumerate(res_a.reranked_hits[:5], start=1):
                     raw = (h.payload or {}).get("_node_text") or ""
@@ -247,11 +244,8 @@ async def query_stream(question: str, model: str = "gpt"):
                     title = " ".join(str(raw).splitlines())
                     yield f"data: [HITS-B] [{i}] {title}\n\n"
 
-                # 🔹 아래 LLM 프롬프트 빌드 부분에서 context_a/context_b 에는
-                # res_a.context / res_b.context 을 그대로 사용
                 context_a, refs_a = res_a.context, res_a.refs
                 context_b, refs_b = res_b.context, res_b.refs
-
             # -------- 프롬프트 빌드 & 스트리밍 --------
 
             # RAG가 필요 없거나, 둘 다 컨텍스트가 비었으면: 단일 Chat 모드
@@ -283,10 +277,7 @@ async def query_stream(question: str, model: str = "gpt"):
                 yield "data: [END]\n\n"
                 return
 
-            # ============================
-            # 여기부터는 RAG A/B 비교 모드
-            # ============================
-
+            # RAG A/B 비교
             # ---------- A 스택 응답 ----------
             if context_a:
                 ref_lines_a = "\n".join(refs_a) if refs_a else "(출처 정보 없음)"
@@ -314,7 +305,7 @@ async def query_stream(question: str, model: str = "gpt"):
 
 답변 형식 가이드라인(아주 중요):
 1. 첫 문단에 2~3문장으로 전체 내용을 한국어로 요약합니다.
-2. 그 다음에는 "1. 소제목" 형식의 번호 매기기 목록으로 핵심 내용을 정리합니다.
+2. 그 다음에는 "1. 소제목" 형식의 번호 매기기 목록으로 핵심 내용을 정리합니다. 소제목은 내용을 압축하여 임의로 작성하세요
    - 각 항목은 "1. 소제목 [1][3]" 처럼 관련 출처 번호를 대괄호로 표기합니다.
    - 소제목 아래 줄에서 2~4문장 정도로 설명을 덧붙입니다.
 3. 문장 중간에 근거를 달 때는 "…라는 점이 보고되었습니다[1][3]."처럼 [1] 형태의 인용 번호를 사용합니다.
@@ -377,7 +368,7 @@ async def query_stream(question: str, model: str = "gpt"):
 
 답변 형식 가이드라인(아주 중요):
 1. 첫 문단에 2~3문장으로 전체 내용을 한국어로 요약합니다.
-2. 그 다음에는 "1. 소제목" 형식의 번호 매기기 목록으로 핵심 내용을 정리합니다.
+2. 그 다음에는 "1. 소제목" 형식의 번호 매기기 목록으로 핵심 내용을 정리합니다. 소제목은 내용을 압축하여 임의로 작성하세요
    - 각 항목은 "1. 소제목 [1][3]" 처럼 관련 출처 번호를 대괄호로 표기합니다.
    - 소제목 아래 줄에서 2~4문장 정도로 설명을 덧붙입니다.
 3. 문장 중간에 근거를 달 때는 "…라는 점이 보고되었습니다[1][3]."처럼 [1] 형태의 인용 번호를 사용합니다.

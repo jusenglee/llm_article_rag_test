@@ -152,6 +152,7 @@
            FastAPI에서 MODEL_MAP 으로 Triton 모델 이름으로 매핑하면 됨 -->
       <option value="gpt">GPT-OSS (gpt_oss_0)</option>
       <option value="gemma">Gemma vLLM (gemma_vllm_0)</option>
+<!--      <option value="exaone">exaone vLLM (exaone_0)</option>-->
       <!-- EXAONE 붙이면 여기 활성화
       <option value="exaone">EXAONE-4.0 32B</option>
       -->
@@ -520,10 +521,6 @@
         }
         mainDiv.textContent += line;
         mainDiv.scrollTop = mainDiv.scrollHeight;
-
-        // 👇 Chat 모드에서도 스트리밍 텍스트 로그에 같이 출력
-        logBox.textContent += line + "\n";
-        logBox.scrollTop = logBox.scrollHeight;
         return;
       }
 
