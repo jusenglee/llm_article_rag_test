@@ -1,0 +1,11 @@
+# Python venv
+.venv/
+venv/
+env/
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*.pyo
+
+#
