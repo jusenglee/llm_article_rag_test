@@ -12,13 +12,13 @@ if not logger.handlers:
 # Qdrant / Embedding (A)
 QDRANT_HOST  = os.getenv("QDRANT_HOST", "211.241.177.73")
 QDRANT_PORT  = int(os.getenv("QDRANT_PORT", 6334))
-COLLECTION   = os.getenv("QDRANT_COLLECTION", "peS2o_rag")
-EMBED_MODEL  = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+COLLECTION   = os.getenv("QDRANT_COLLECTION", "e5_instruct_rag_100_000")
+EMBED_MODEL  = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-large-instruct")
 
 # Qdrant / Embedding (B)
 QDRANT_HOST_B  = os.getenv("QDRANT_HOST_B", QDRANT_HOST)
 QDRANT_PORT_B  = int(os.getenv("QDRANT_PORT_B", QDRANT_PORT))
-COLLECTION_B   = os.getenv("QDRANT_COLLECTION_B", "e5_rag")
+COLLECTION_B   = os.getenv("QDRANT_COLLECTION_B", "e5_rag_100_000")
 EMBED_MODEL_B  = os.getenv("EMBEDDING_MODEL_B", "intfloat/multilingual-e5-large")
 
 # Triton
@@ -27,7 +27,6 @@ DEFAULT_MODEL_NAME = os.getenv("TRITON_MODEL", "gpt_oss_0")
 TOKENIZER_MAP = {
     "gpt_oss_0": "openai/gpt-oss-20b",
     "gemma_vllm_0": "./data/gemma_vllm_0",
-    "EXAONE_0": "./data/EXAONE_0",
 }
 
 # 하이퍼파라미터
