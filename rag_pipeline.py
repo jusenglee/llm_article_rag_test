@@ -140,7 +140,6 @@ def run_rag_once(
       3) dense + lexical hybrid 검색 (dense_retrieve_hybrid)
       4) RRF + 키워드 부스팅 기반 재정렬 (rrf_rerank)
       5) LLM 컨텍스트/출처 문자열 생성 (build_context)
-      6) (옵션) LLM 호출로 최종 답변 생성
 
     timings 딕셔너리에는 각 단계별 소요 시간을 기록해 반환한다.
     """
@@ -193,16 +192,6 @@ def run_rag_once(
     context, refs = build_context(reranked)
     timings["build_context"] = time.time() - t0
 
-    # 6) (옵션) LLM 호출
-    llm_answer = None
-    if with_llm:
-        # TODO: 여기에 컨텍스트 기반 LLM 호출 로직(triton_infer 등)을 구현
-        #  - system/user 프롬프트 구성
-        #  - 스트리밍/비스트리밍 여부
-        #  - extract_final_answer 활용 여부 등
-        ...
-        timings["llm_answer"] = time.time() - t0
-
     timings["total"] = time.time() - t_all0
 
     logger.info(
@@ -223,7 +212,6 @@ def run_rag_once(
         context=context,
         refs=refs,
         timings=timings,
-        llm_answer=llm_answer,
     )
 
 
