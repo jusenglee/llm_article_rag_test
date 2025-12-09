@@ -153,6 +153,7 @@ def expand_query_kor(query: str) -> Tuple[str, List[str]]:
 
     # 3) dense 검색용 확장 텍스트
     expanded_query = " ".join(all_terms)
+    print(expanded_query)
     return expanded_query, all_terms
 
 def dense_retrieve_hybrid(
