@@ -3,7 +3,7 @@ import time
 from typing import Dict
 
 from settings import (
-    DEFAULT_MODEL_NAME, COLLECTION, COLLECTION_B, EMBED_MODEL, EMBED_MODEL_B,
+    DEFAULT_MODEL_NAME, COLLECTION, COLLECTION_B, EMBED_MODEL, TRITON_EMBED_MODEL_B,
     logger,
 )
 from rag_types import RagResult
@@ -72,6 +72,7 @@ def run_rag_once(
 
     # 3) dense 검색
     t0 = time.time()
+    print(expanded_query)
     hits = dense_retrieve_hybrid(
         client=qdr,
         emb=emb,

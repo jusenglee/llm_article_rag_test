@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import logging, nest_asyncio, time, traceback
+import logging, time, traceback
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -16,7 +16,6 @@ from triton_client import triton_infer, get_tokenizer_for_model, ensure_single_m
 # ---------------------------
 # 초기 설정
 # ---------------------------
-nest_asyncio.apply()
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("uvicorn")
@@ -117,55 +116,55 @@ async def query_stream(question: str, model: str = "gpt"):
             names = [getattr(m, "name", "?") for m in getattr(repo, "models", [])]
             yield f"data: [MODEL] 현재 등록된 모델: {', '.join(names)}\n\n"
 
-            # 0-2) target 이외 모델 UNLOAD
-            for m in getattr(repo, "models", []):
-                name = getattr(m, "name", None)
-                if not name or name == model_name:
-                    continue
-                try:
-                    if cli.is_model_ready(name):
-                        yield f"data: [MODEL] 다른 모델 언로드 요청: {name}\n\n"
-                        cli.unload_model(name)
-                        yield f"data: [MODEL] 언로드 완료: {name}\n\n"
-                except Exception as e:
-                    logger.warning(f"[TRITON] unload_model({name}) failed: {e}")
-                    yield f"data: [MODEL] 언로드 실패({name}): {type(e).__name__}: {e}\n\n"
+            # # 0-2) target 이외 모델 UNLOAD
+            # for m in getattr(repo, "models", []):
+            #     name = getattr(m, "name", None)
+            #     if not name or name == model_name:
+            #         continue
+            #     try:
+            #         if cli.is_model_ready(name):
+            #             yield f"data: [MODEL] 다른 모델 언로드 요청: {name}\n\n"
+            #             cli.unload_model(name)
+            #             yield f"data: [MODEL] 언로드 완료: {name}\n\n"
+            #     except Exception as e:
+            #         logger.warning(f"[TRITON] unload_model({name}) failed: {e}")
+            #         yield f"data: [MODEL] 언로드 실패({name}): {type(e).__name__}: {e}\n\n"
 
             # 0-3) target 모델 상태 확인
-            try:
-                if cli.is_model_ready(model_name):
-                    yield f"data: [MODEL] {model_name} 이미 READY 상태입니다.\n\n"
-                else:
-                    # 0-4) target 모델 로드 시작
-                    yield f"data: [MODEL] {model_name} 로드 시작...\n\n"
-                    cli.load_model(model_name)
-                    start = time.time()
-                    timeout = 120.0
-
-                    # 0-5) READY 될 때까지 polling + 진행 상황 SSE 전송
-                    while True:
-                        await asyncio.sleep(0.5)
-                        elapsed = time.time() - start
-
-                        try:
-                            if cli.is_model_ready(model_name):
-                                yield f"data: [MODEL] {model_name} READY (t={elapsed:.2f}s)\n\n"
-                                break
-                        except Exception as e:
-                            logger.warning(f"[TRITON] is_model_ready({model_name}) check failed: {e}")
-                            yield f"data: [MODEL] 상태 확인 실패: {type(e).__name__}: {e}\n\n"
-
-                        if elapsed > timeout:
-                            raise TimeoutError(
-                                f"Timeout while waiting for model {model_name} to be READY"
-                            )
-
-                        # 진행 중인 상태도 계속 쏴줌
-                        yield f"data: [MODEL] {model_name} 로딩 중... (elapsed={elapsed:.1f}s)\n\n"
-
-            except Exception as e:
-                raise e
-
+        #     try:
+        #         if cli.is_model_ready(model_name):
+        #             yield f"data: [MODEL] {model_name} 이미 READY 상태입니다.\n\n"
+        #         else:
+        #             # 0-4) target 모델 로드 시작
+        #             yield f"data: [MODEL] {model_name} 로드 시작...\n\n"
+        #             cli.load_model(model_name)
+        #             start = time.time()
+        #             timeout = 120.0
+        #
+        #             # 0-5) READY 될 때까지 polling + 진행 상황 SSE 전송
+        #             while True:
+        #                 await asyncio.sleep(0.5)
+        #                 elapsed = time.time() - start
+        #
+        #                 try:
+        #                     if cli.is_model_ready(model_name):
+        #                         yield f"data: [MODEL] {model_name} READY (t={elapsed:.2f}s)\n\n"
+        #                         break
+        #                 except Exception as e:
+        #                     logger.warning(f"[TRITON] is_model_ready({model_name}) check failed: {e}")
+        #                     yield f"data: [MODEL] 상태 확인 실패: {type(e).__name__}: {e}\n\n"
+        #
+        #                 if elapsed > timeout:
+        #                     raise TimeoutError(
+        #                         f"Timeout while waiting for model {model_name} to be READY"
+        #                     )
+        #
+        #                 # 진행 중인 상태도 계속 쏴줌
+        #                 yield f"data: [MODEL] {model_name} 로딩 중... (elapsed={elapsed:.1f}s)\n\n"
+        #
+        #     except Exception as e:
+        #         raise e
+        #
         except Exception as e:
             err = f"Triton 모델 로드 단계에서 오류: {type(e).__name__}: {e}"
             traceback.print_exc()
@@ -283,11 +282,12 @@ async def query_stream(question: str, model: str = "gpt"):
                 ref_lines_a = "\n".join(refs_a) if refs_a else "(출처 정보 없음)"
 
                 sys_msg_a = (
-                    "당신은 과학·기술 논문을 요약해서 한국어로 설명하는 전문 어시스턴트입니다.\n"
-                    "- 반드시 제공된 컨텍스트(문서 발췌)에서만 근거를 사용하세요.\n"
-                    "- 컨텍스트에 없으면 '제공된 문서에서 찾지 못했습니다.'라고만 말하고, 임의로 추측하지 마세요.\n"
-                    "- 한국어 문장에서 정상적인 띄어쓰기를 사용하세요.\n"
-                    "- 그 안쪽에만 실제 한국어 답변을 작성하고, 그 밖에는 어떤 분석/설명/계획 문장도 쓰지 마세요.\n"
+                    "당신은 과학·기술 논문을 요약해서 한국어로 설명하는 전문 어시스턴트입니다. "
+                    "데이터베이스에서 검색된 컨텍스트(문서 발췌)를 기반으로 사용자의 질문에 답하세요.\n"
+                    "- 반드시 제공된 컨텍스트에서만 근거를 사용하세요.\n"
+                    "- 컨텍스트에 관련 정보가 없으면, \"제공된 문서에서 찾지 못했습니다.\" 한 문장만 출력하세요.\n"
+                    "- 그 외의 경우, 컨텍스트에 포함되지 않은 내용은 추측하거나 보완해서 쓰지 마세요.\n"
+                    "- 출력에는 사용자에게 보여줄 최종 한국어 답변만 작성하세요.\n"
                     "이 응답은 [A 스택] 검색 결과를 기반으로 합니다."
                 )
                 user_msg_a = f"""
@@ -303,14 +303,22 @@ async def query_stream(question: str, model: str = "gpt"):
 사용자의 질문:
 {question}
 
-답변 형식 가이드라인(아주 중요):
+중요: 
+- 만약 위 컨텍스트에 사용자의 질문에 답하기 위한 관련 정보가 전혀 없다면,
+  아래의 답변 형식 가이드는 모두 무시하고
+  "제공된 문서에서 찾지 못했습니다." 한 문장만 출력하세요.
+
+- 관련 정보가 있을 때만 아래 답변 형식을 따르세요.
+
+답변 형식 가이드라인:
 1. 첫 문단에 2~3문장으로 전체 내용을 한국어로 요약합니다.
-2. 그 다음에는 "1. 소제목" 형식의 번호 매기기 목록으로 핵심 내용을 정리합니다. 소제목은 내용을 압축하여 임의로 작성하세요
-   - 각 항목은 "1. 소제목 [1][3]" 처럼 관련 출처 번호를 대괄호로 표기합니다.
-   - 소제목 아래 줄에서 2~4문장 정도로 설명을 덧붙입니다.
+2. 그 다음에는 "1. 소제목" 형식의 번호 매기기 목록으로 핵심 내용을 정리합니다.
+   - 소제목은 컨텍스트 내용을 압축해 한국어로 알기 쉽게 지어주세요.
+   - 각 항목은 "1. 소제목 [1][3]"처럼 관련 출처 번호를 대괄호로 표기합니다.
+   - 소제목 아래 줄에서 2~4문장 정도로 내용을 설명합니다.
 3. 문장 중간에 근거를 달 때는 "…라는 점이 보고되었습니다[1][3]."처럼 [1] 형태의 인용 번호를 사용합니다.
-4. 한국어 문장 사이에는 일반적인 띄어쓰기를 유지하고,
-   '의학기술의최신동향은'처럼 단어를 모두 붙여 쓰지 말고
+4. 한국어 문장 사이에는 일반적인 띄어쓰기를 사용하고,
+   '의학기술의최신동향은'처럼 모든 단어를 붙여 쓰지 말고
    '의학 기술의 최신 동향은'처럼 자연스러운 띄어쓰기를 사용하세요.
 5. 마지막에는 아래 예시처럼 참고문헌 섹션을 추가합니다.
 
@@ -346,15 +354,16 @@ async def query_stream(question: str, model: str = "gpt"):
                 ref_lines_b = "\n".join(refs_b) if refs_b else "(출처 정보 없음)"
 
                 sys_msg_b = (
-                    "당신은 과학·기술 논문을 요약해서 한국어로 설명하는 전문 어시스턴트입니다.\n"
-                    "- 반드시 제공된 컨텍스트(문서 발췌)에서만 근거를 사용하세요.\n"
-                    "- 컨텍스트에 없으면 '제공된 문서에서 찾지 못했습니다.'라고만 말하고, 임의로 추측하지 마세요.\n"
-                    "- 한국어 문장에서 정상적인 띄어쓰기를 사용하세요.\n"
-                    "- 그 안쪽에만 실제 한국어 답변을 작성하고, 그 밖에는 어떤 분석/설명/계획 문장도 쓰지 마세요.\n"
+                    "당신은 과학·기술 논문을 요약해서 한국어로 설명하는 전문 어시스턴트입니다. "
+                    "데이터베이스에서 검색된 컨텍스트(문서 발췌)를 기반으로 사용자의 질문에 답하세요.\n"
+                    "- 반드시 제공된 컨텍스트에서만 근거를 사용하세요.\n"
+                    "- 컨텍스트에 관련 정보가 없으면, \"제공된 문서에서 찾지 못했습니다.\" 한 문장만 출력하세요.\n"
+                    "- 그 외의 경우, 컨텍스트에 포함되지 않은 내용은 추측하거나 보완해서 쓰지 마세요.\n"
+                    "- 출력에는 사용자에게 보여줄 최종 한국어 답변만 작성하세요.\n"
                     "이 응답은 [B 스택] 검색 결과를 기반으로 합니다."
                 )
                 user_msg_b = f"""
-다음은 [B 스택]에서 검색한 관련 문서 발췌입니다. 각 문단 앞의 번호는 출처 번호입니다.
+다음은 [A 스택]에서 검색한 관련 문서 발췌입니다. 각 문단 앞의 번호는 출처 번호입니다.
 
 [컨텍스트 발췌 시작]
 {context_b}
@@ -366,14 +375,22 @@ async def query_stream(question: str, model: str = "gpt"):
 사용자의 질문:
 {question}
 
-답변 형식 가이드라인(아주 중요):
+중요: 
+- 만약 위 컨텍스트에 사용자의 질문에 답하기 위한 관련 정보가 전혀 없다면,
+  아래의 답변 형식 가이드는 모두 무시하고
+  "제공된 문서에서 찾지 못했습니다." 한 문장만 출력하세요.
+
+- 관련 정보가 있을 때만 아래 답변 형식을 따르세요.
+
+답변 형식 가이드라인:
 1. 첫 문단에 2~3문장으로 전체 내용을 한국어로 요약합니다.
-2. 그 다음에는 "1. 소제목" 형식의 번호 매기기 목록으로 핵심 내용을 정리합니다. 소제목은 내용을 압축하여 임의로 작성하세요
-   - 각 항목은 "1. 소제목 [1][3]" 처럼 관련 출처 번호를 대괄호로 표기합니다.
-   - 소제목 아래 줄에서 2~4문장 정도로 설명을 덧붙입니다.
+2. 그 다음에는 "1. 소제목" 형식의 번호 매기기 목록으로 핵심 내용을 정리합니다.
+   - 소제목은 컨텍스트 내용을 압축해 한국어로 알기 쉽게 지어주세요.
+   - 각 항목은 "1. 소제목 [1][3]"처럼 관련 출처 번호를 대괄호로 표기합니다.
+   - 소제목 아래 줄에서 2~4문장 정도로 내용을 설명합니다.
 3. 문장 중간에 근거를 달 때는 "…라는 점이 보고되었습니다[1][3]."처럼 [1] 형태의 인용 번호를 사용합니다.
-4. 한국어 문장 사이에는 일반적인 띄어쓰기를 유지하고,
-   '의학기술의최신동향은'처럼 단어를 모두 붙여 쓰지 말고
+4. 한국어 문장 사이에는 일반적인 띄어쓰기를 사용하고,
+   '의학기술의최신동향은'처럼 모든 단어를 붙여 쓰지 말고
    '의학 기술의 최신 동향은'처럼 자연스러운 띄어쓰기를 사용하세요.
 5. 마지막에는 아래 예시처럼 참고문헌 섹션을 추가합니다.
 
@@ -381,7 +398,6 @@ async def query_stream(question: str, model: str = "gpt"):
 [1] 논문 제목A
 [2] 논문 제목B
 [3] 논문 제목C
-
 """
 
                 try:

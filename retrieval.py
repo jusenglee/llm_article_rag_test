@@ -62,9 +62,7 @@ Output:
         max_tokens=64,
         temperature=0.3,
     )
-
-    resp = extract_final_answer(raw)  # 🔴 CoT 제거
-
+    resp = extract_final_answer(raw)  #  CoT 제거
     try:
         # JSON 파싱 시도 (배열 찾기)
         match = re.search(r"\[.*?\]", resp, re.S)
@@ -76,12 +74,21 @@ Output:
     # Fallback: 쉼표/줄바꿈 분리
     parts = re.split(r"[,;\n]", resp)
     kws = [re.sub(r"[^A-Za-z0-9\s\-]", "", p).strip() for p in parts]
+    print(kws)
     return [k for k in kws if 2 <= len(k) <= 40][:10]
 
+def dedup_keep_order(xs):
+    seen = set()
+    out = []
+    for x in xs:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
 def expand_query_kor(query: str) -> Tuple[str, List[str]]:
-    terms = dynamic_expand_query_llm(query)
-    # 원본 쿼리 + 확장어
-    all_terms = sorted(set(terms + [query]))
+    terms = dynamic_expand_query_llm(query)  # LLM이 준 후보들
+    all_terms = dedup_keep_order(terms + [query])
     expanded_query = " ".join(all_terms)
     return expanded_query, all_terms
 

@@ -150,7 +150,7 @@
     <select id="modelSelect" name="model">
       <!-- value 값은 서버에서 사용하는 키(gpt/gemma/exaone)로 맞춰두고,
            FastAPI에서 MODEL_MAP 으로 Triton 모델 이름으로 매핑하면 됨 -->
-      <option value="gpt">GPT-OSS (gpt_oss_0)</option>
+<!--?      <option value="gpt">GPT-OSS (gpt_oss_0)</option>-->
       <option value="gemma">Gemma vLLM (gemma_vllm_0)</option>
 <!--      <option value="exaone">exaone vLLM (exaone_0)</option>-->
       <!-- EXAONE 붙이면 여기 활성화
@@ -183,7 +183,7 @@
       </div>
     </div>
     <div id="answer-b-card" class="card">
-      <h3>🅱 RAG-B 응답 (intfloat/multilingual-e5-large 스택)</h3>
+      <h3>🅱 RAG-B 응답 (intfloat/e5_mistral_7b_embed 스택)</h3>
       <div id="answer-b" class="loading">
         듀얼 RAG 모드에서 B 스택 응답이 여기에 표시됩니다.
       </div>

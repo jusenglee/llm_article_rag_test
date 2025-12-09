@@ -18,12 +18,13 @@ EMBED_MODEL  = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 # Qdrant / Embedding (B)
 QDRANT_HOST_B  = os.getenv("QDRANT_HOST_B", QDRANT_HOST)
 QDRANT_PORT_B  = int(os.getenv("QDRANT_PORT_B", QDRANT_PORT))
-COLLECTION_B   = os.getenv("QDRANT_COLLECTION_B", "e5_rag")
-EMBED_MODEL_B  = os.getenv("EMBEDDING_MODEL_B", "intfloat/multilingual-e5-large")
+COLLECTION_B   = os.getenv("QDRANT_COLLECTION_B", "mistral_rag")
+TRITON_URL_EMBED_B = os.getenv("TRITON_URL_EMBED_B", "211.241.177.73:8001")
+TRITON_EMBED_MODEL_B = os.getenv("TRITON_EMBED_MODEL_B", "e5_mistral_7b_embed")
 
 # Triton
 TRITON_URL         = os.getenv("TRITON_URL", "211.241.177.73:8001")
-DEFAULT_MODEL_NAME = os.getenv("TRITON_MODEL", "gpt_oss_0")
+DEFAULT_MODEL_NAME = os.getenv("TRITON_MODEL", "gemma_vllm_0")
 TOKENIZER_MAP = {
     "gpt_oss_0": "openai/gpt-oss-20b",
     "gemma_vllm_0": "./data/gemma_vllm_0",

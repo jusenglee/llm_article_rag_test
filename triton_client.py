@@ -33,6 +33,63 @@ def get_tokenizer_for_model(model_name: str) -> AutoTokenizer:
         )
     return _tokenizers[model_name]
 
+
+def _get_prompt_tokens(model_name: str, prompt: str) -> int:
+    """
+    주어진 모델 기준으로 프롬프트 토큰 길이 계산.
+    토크나이저 문제 발생 시에는 len(prompt)로 아주 러프하게 fallback.
+    """
+    try:
+        tok = get_tokenizer_for_model(model_name)
+        # special token은 이미 시스템 프롬프트에 들어가 있을 가능성 있으니 False
+        ids = tok.encode(prompt, add_special_tokens=False)
+        return len(ids)
+    except Exception as e:
+        logger.warning(f"[TRITON] prompt token 계산 실패, fallback 사용: {e}")
+        # 완전 비었으면 0, 아니면 글자 수 기준 러프 추정
+        return max(1, len(prompt) // 2)
+
+
+def _compute_max_new_tokens(
+        model_name: str,
+        prompt: str,
+        max_tokens_hint: int | None = None,
+) -> int:
+    """
+    - 토크나이저의 model_max_length(없으면 8192 추정)를 기준으로
+      prompt_tokens + max_new_tokens <= max_seq_len - margin 을 만족하도록 조정.
+    - max_tokens_hint(= 인자로 받은 max_tokens)는 상한(cap)으로만 사용.
+    """
+    prompt_tokens = _get_prompt_tokens(model_name, prompt)
+
+    try:
+        tok = get_tokenizer_for_model(model_name)
+        max_seq_len = getattr(tok, "model_max_length", 8192)
+        # HF 쪽에서 종종 엄청 큰 값(1e30 같은) 넣어두는 경우 방어
+        if max_seq_len is None or max_seq_len > 100_000:
+            max_seq_len = 8192
+    except Exception:
+        max_seq_len = 8192
+
+    SAFETY_MARGIN = 256      # 여유 버퍼
+    MIN_NEW_TOKENS = 64      # 최소 생성 토큰
+
+    # settings.MAX_TOKENS 를 기본 상한으로, 인자로 들어오면 그것으로 override
+    cap = int(max_tokens_hint) if max_tokens_hint is not None else int(MAX_TOKENS)
+
+    available = max_seq_len - prompt_tokens - SAFETY_MARGIN
+    if available <= 0:
+        logger.warning(
+            f"[TRITON] prompt가 이미 max_seq_len을 거의 다 쓴 상태입니다: "
+            f"prompt_tokens={prompt_tokens}, max_seq_len={max_seq_len}"
+        )
+        # 그래도 최소한 조금은 생성하도록
+        return max(MIN_NEW_TOKENS, min(cap, 128))
+
+    max_new = min(cap, available)
+    return max(MIN_NEW_TOKENS, max_new)
+
+
 def extract_final_answer(raw: str) -> str:
     """gpt-oss가 analysis/assistantfinal 포맷으로 뱉을 때, 최종 답변만 추출."""
     if not raw:
@@ -219,8 +276,15 @@ def _triton_infer_sync(
         temperature: float,
         top_p: float,
 ) -> str:
+    # 🔹 여기서 동적으로 max_new_tokens 계산
+    dynamic_max_tokens = _compute_max_new_tokens(
+        model_name=model_name,
+        prompt=prompt,
+        max_tokens_hint=max_tokens,
+    )
+
     text, sparams = _make_inputs(
-        prompt, max_tokens=max_tokens,
+        prompt, max_tokens=dynamic_max_tokens,
         temperature=temperature, top_p=top_p, stream=True
     )
 
