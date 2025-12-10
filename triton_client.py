@@ -7,7 +7,6 @@ Triton Inference Server gRPC 클라이언트 래퍼 모듈.
 - max_new_tokens를 시퀀스 길이에 맞게 동적으로 계산
 - gpt-oss 계열 모델의 assistantfinal 포맷 파싱/스트리밍 처리
 - 스트리밍/비스트리밍 공용 엔트리 포인트 triton_infer()
-- Triton 모델 load/unload 유틸 (ensure_single_model_loaded, unload_model_safe)
 
 주의 사항:
 - Triton Python gRPC 클라이언트는 "하나의 InferenceServerClient 인스턴스당
@@ -166,10 +165,6 @@ def stream_after_assistantfinal(chunks):
     """
     gpt-oss 스트리밍 결과(chunks)를 받아서
     'assistantfinal' 이후 텍스트만 yield하는 제너레이터.
-
-    - 마커가 나오기 전까지는 아무것도 내보내지 않음
-    - 마커가 나온 시점부터 이후 텍스트만 스트리밍
-    - 마커가 끝까지 안 나오면 전체 버퍼를 그대로 fallback으로 전송
     """
     marker = ASSISTANT_FINAL_MARKER.lower()
     seen = False
@@ -207,6 +202,7 @@ def stream_after_assistantfinal(chunks):
         yield buf
     elif not seen and buf:
         # assistantfinal이 한 번도 안 나온 경우 fallback:
+        # 전체 버퍼를 그냥 보내거나, 정책에 따라 버릴 수도 있음.
         logger.warning(
             "[gpt-oss] assistantfinal 마커를 찾지 못했습니다. 전체 버퍼를 그대로 전송합니다."
         )
@@ -255,7 +251,6 @@ def _make_inputs(
 
     # vLLM-backend 권장 명칭: sampling_parameters
     sparams = InferInput("sampling_parameters", [1], "BYTES")
-
     # vLLM Python backend 쪽 구현이 문자열 기반 파싱을 사용하는 경우가 많음
     params = {
         "temperature": str(float(temperature)),
@@ -396,25 +391,18 @@ def _triton_infer_sync(
     """
     내부용 sync infer.
 
+    - 호출 측에서 미리 _compute_max_new_tokens 로 계산된 max_tokens를 받아 사용.
     - 실제로는 스트리밍을 사용하되, 모든 chunk 를 모아서 하나의 문자열로 반환.
-    - max_new_tokens 는 _compute_max_new_tokens 로 동적으로 계산.
     """
-    # 1) 동적으로 max_new_tokens 계산
-    dynamic_max_tokens = _compute_max_new_tokens(
-        model_name=model_name,
-        prompt=prompt,
-        max_tokens_hint=max_tokens,
-    )
-
-    # 2) Triton 입력 텐서 구성
+    # 1) Triton 입력 텐서 구성
     text, sparams = _make_inputs(
         prompt,
-        max_tokens=dynamic_max_tokens,
+        max_tokens=max_tokens,
         temperature=temperature,
         top_p=top_p,
     )
 
-    # 3) 스트리밍 → 전체 문자열 accumulate
+    # 2) 스트리밍 → 전체 문자열 accumulate
     accumulated_text = ""
     for chunk in _triton_stream_generator(
             model_name,
@@ -428,7 +416,7 @@ def _triton_infer_sync(
 
     accumulated_text = accumulated_text.strip()
 
-    # 4) gpt-oss 계열이면 assistantfinal 이후만 추출
+    # 3) gpt-oss 계열이면 assistantfinal 이후만 추출
     if _is_gpt_oss_model(model_name):
         return extract_final_answer(accumulated_text)
 
@@ -438,6 +426,17 @@ def _triton_infer_sync(
 # ---------------------------------------------------------------------------
 # 6. 공용 엔트리 포인트: triton_infer()
 # ---------------------------------------------------------------------------
+def log_prompt_tokens(model_name: str, prompt: str, tag: str = ""):
+    try:
+        tok = get_tokenizer_for_model(model_name)
+        ids = tok.encode(prompt, add_special_tokens=False)
+        logger.info(
+            f"[TRITON][TOK] {tag} model={model_name}, "
+            f"prompt_chars={len(prompt)}, prompt_tokens={len(ids)}"
+        )
+    except Exception as e:
+        logger.warning(f"[TRITON][TOK] token count failed: {e}")
+
 def triton_infer(
         model_name: str,
         prompt: str,
@@ -466,12 +465,19 @@ def triton_infer(
         - stream=False → str (전체 응답)
     """
     logger.info(f"[TRITON] infer start - model={model_name}, len={len(prompt)}")
+    log_prompt_tokens(model_name, prompt, tag="infer")
+
+    dynamic_max_tokens = _compute_max_new_tokens(
+        model_name=model_name,
+        prompt=prompt,
+        max_tokens_hint=max_tokens,
+    )
 
     if stream:
-        # 스트리밍 모드 (max_tokens는 호출자가 지정한 값 그대로 사용)
+        # 스트리밍 모드
         text, sparams = _make_inputs(
             prompt,
-            max_tokens=max_tokens,
+            max_tokens=dynamic_max_tokens,
             temperature=temperature,
             top_p=top_p,
         )
@@ -497,80 +503,7 @@ def triton_infer(
     return _triton_infer_sync(
         model_name,
         prompt,
-        max_tokens=max_tokens,
+        max_tokens=dynamic_max_tokens,
         temperature=temperature,
         top_p=top_p,
     )
-
-
-# ---------------------------------------------------------------------------
-# 7. 모델 로드/언로드 유틸
-# ---------------------------------------------------------------------------
-def ensure_single_model_loaded(target_model: str, timeout: float = 120.0) -> None:
-    """
-    1) 모델 레포지토리 인덱스를 보고 target 이외 모델은 모두 unload
-    2) target 모델이 READY 상태가 아니면 load + READY 될 때까지 대기
-
-    - "한 번에 하나의 vLLM 모델만 올리는" 정책을 구현하기 위한 헬퍼.
-    """
-    cli = get_triton_client()
-
-    # 1. 모델 레포지토리 인덱스 조회
-    try:
-        repo = cli.get_model_repository_index()
-    except Exception as e:
-        logger.error(f"[TRITON] get_model_repository_index failed: {e}")
-        raise
-
-    # 2. target 외 모델 unload
-    for m in getattr(repo, "models", []):
-        name = getattr(m, "name", None)
-        if not name or name == target_model:
-            continue
-        try:
-            if cli.is_model_ready(name):
-                logger.info(f"[TRITON] unloading other model: {name}")
-                cli.unload_model(name)
-        except Exception as e:
-            logger.warning(f"[TRITON] unload_model({name}) failed: {e}")
-
-    # 3. target 이 이미 READY면 바로 리턴
-    try:
-        if cli.is_model_ready(target_model):
-            logger.info(f"[TRITON] target model {target_model} already READY")
-            return
-    except Exception as e:
-        logger.warning(f"[TRITON] is_model_ready({target_model}) error: {e}")
-
-    # 4. target load
-    logger.info(f"[TRITON] loading model: {target_model}")
-    cli.load_model(target_model)
-
-    # 5. READY 될 때까지 polling
-    start = time.time()
-    while True:
-        try:
-            if cli.is_model_ready(target_model):
-                logger.info(f"[TRITON] model {target_model} READY")
-                return
-        except Exception as e:
-            logger.warning(f"[TRITON] is_model_ready({target_model}) check failed: {e}")
-
-        if time.time() - start > timeout:
-            raise TimeoutError(f"Timeout while waiting for model {target_model} to be READY")
-
-        time.sleep(0.5)
-
-
-def unload_model_safe(model_name: str) -> None:
-    """
-    지정한 모델이 READY 상태이면 unload를 시도하고,
-    실패해도 서비스 전체가 죽지 않도록 warning만 남긴다.
-    """
-    cli = get_triton_client()
-    try:
-        if cli.is_model_ready(model_name):
-            logger.info(f"[TRITON] unloading model: {model_name}")
-            cli.unload_model(model_name)
-    except Exception as e:
-        logger.warning(f"[TRITON] unload_model({model_name}) failed: {e}")

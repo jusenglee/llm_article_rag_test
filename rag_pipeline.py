@@ -108,7 +108,7 @@ def decide_rag_needed(query: str, model_name: str = DEFAULT_MODEL_NAME) -> bool:
 
     try:
         raw = triton_infer(model_name, prompt, stream=False, max_tokens=4)
-        resp = extract_final_answer(raw).strip().upper()
+        resp = raw.strip().upper()
     except Exception as e:
         logger.warning(f"[decide_rag_needed] LLM gating failed: {e}")
         # 게이팅 자체가 실패하면 보수적으로 RAG 사용
@@ -128,7 +128,6 @@ def decide_rag_needed(query: str, model_name: str = DEFAULT_MODEL_NAME) -> bool:
 def run_rag_once(
         query: str,
         stack: str = "A",
-        with_llm: bool = True,
         model_name: str = DEFAULT_MODEL_NAME,
 ) -> RagResult:
     """
@@ -167,7 +166,7 @@ def run_rag_once(
 
     # 2) 쿼리 확장 (한글 질의 → 영문 키워드 + 원문 포함 확장 문자열)
     t0 = time.time()
-    expanded_query, kws = expand_query_kor(query)
+    expanded_query, kws = expand_query_kor(query,model_name)
     timings["expand_query"] = time.time() - t0
 
     # 3) hybrid 검색 (dense + lexical)
@@ -217,7 +216,6 @@ def run_rag_once(
 
 def run_rag_ab_compare(
         query: str,
-        with_llm: bool = True,
         model_name: str = DEFAULT_MODEL_NAME,
 ) -> Dict[str, RagResult]:
     """
@@ -230,9 +228,8 @@ def run_rag_ab_compare(
         }
 
     - 오프라인 실험/레포트/로그 분석에 활용 가능
-    - with_llm=False 로 호출하면 검색/리랭크/컨텍스트까지만 비교 가능
     """
-    res_a = run_rag_once(query, stack="A", with_llm=with_llm, model_name=model_name)
-    res_b = run_rag_once(query, stack="B", with_llm=with_llm, model_name=model_name)
+    res_a = run_rag_once(query, stack="A",  model_name=model_name)
+    res_b = run_rag_once(query, stack="B",  model_name=model_name)
 
     return {"A": res_a, "B": res_b}

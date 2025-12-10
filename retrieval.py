@@ -12,10 +12,12 @@ import json
 import re
 import time
 from typing import Any, Dict, List, Tuple
+
+from typing import List, Optional
+from qdrant_client.http.models import Filter, FieldCondition, MatchText
+
 from qdrant_client import QdrantClient
 from rapidfuzz import fuzz
-from sympy.benchmarks.bench_meijerint import timings
-from qdrant_client.http.models import Filter, FieldCondition, MatchText
 
 from settings import (
     FUZZ_MIN,             # fuzzy 매칭 임계값 (0~100)
@@ -26,6 +28,29 @@ from settings import (
     DEFAULT_MODEL_NAME,
 )
 from triton_client import triton_infer, extract_final_answer
+
+
+# ============================================
+# 0. 검색 꼬리 패턴 정의
+# ============================================
+
+SEARCH_TAIL_PATTERNS = [
+    r"데이터베이스에서\s*검색해줘",
+    r"데이터베이스에서\s*검색해 줘",
+    r"검색해줘",
+    r"검색해 줘",
+    r"찾아줘",
+    r"찾아 줘",
+    r"알려줘",
+    r"알려 줘",
+    r"설명해줘",
+    r"설명해 줘",
+]
+
+
+# ============================================
+# 1. 텍스트 유틸 / payload 처리
+# ============================================
 
 def clamp_text(s: Any, max_chars: int = SNIPPET_MAX_CHARS) -> str:
     """
@@ -80,48 +105,106 @@ def _payload_texts(payload: Dict[str, Any]) -> Tuple[str, str]:
 
     return body, title
 
-def dynamic_expand_query_llm(query: str) -> List[str]:
-    """
-    한글 사용자의 질의를 입력으로 받아,
-    LLM을 이용해 '학술 검색용 영문 키워드 리스트'를 생성.
 
-    - LLM에게 JSON array 형태로만 응답하도록 강하게 제한
-    - 실패 시 쉼표/줄바꿈 기준 Fallback 파싱
+def normalize_query_for_expand(query: str) -> str:
     """
+    키워드 확장용으로, '검색해줘/알려줘/찾아줘' 같은
+    액션 꼬리를 제거해 주제만 남긴다.
+    도메인 정보는 전혀 하드코딩하지 않는다.
+    """
+    q = re.sub(r"\s+", " ", (query or "")).strip()
+    for pat in SEARCH_TAIL_PATTERNS:
+        q = re.sub(pat + r"\s*$", "", q)
+    return q.strip()
+
+
+# ============================================
+# 2. LLM 기반 키워드 확장
+# ============================================
+
+def dynamic_expand_query_llm(query: str, model_name: str) -> Tuple[str, List[str]]:
+    """
+    한글/영문 질의를 받아 학술 검색용 확장 쿼리 + 키워드 리스트를 생성.
+
+    반환:
+      expanded_query : dense 임베딩에 넣을 '짧은 영어 문장'
+      keywords       : lexical / fuzzy 부스팅에 쓸 '짧은 영어 키워드 리스트'
+    """
+    core_query = normalize_query_for_expand(query)
+    if not core_query:
+        core_query = (query or "").strip()
+
+    logger.info(f"[EXPAND] core_query={core_query!r}")
+
     prompt = f"""
-You are a scientific keyword generator for academic search.
-Respond ONLY with a JSON array of 8 concise English keywords.
-Do NOT include explanations, examples, or formatting outside the array.
-
-Input: {query}
-Output:
+Rules:
+- keywords:
+  - 3 to 8 short English phrases (1–3 words each)
+  - Focus on main concepts (time, place, field, key terms).
+- Do NOT output anything outside the JSON.
+- Do NOT add comments or explanations.
+    
+Original question: {core_query}
 """.strip()
 
     raw = triton_infer(
         DEFAULT_MODEL_NAME,
         prompt,
         stream=False,
-        max_tokens=64,
-        temperature=0.3,
+        max_tokens=256,
+        temperature=0.0,
     )
+    logger.debug(f"[EXPAND] raw (head)={repr(str(raw)[:300])}")
 
-    # gpt-oss가 analysis/assistantfinal 포맷을 쓸 수 있으므로 최종 답변만 추출
+    # gpt-oss 포맷 대비 (assistantfinal 이후만 추출)
     resp = extract_final_answer(raw)
+    resp = resp.strip()
+    logger.debug(f"[EXPAND] resp (head)={repr(resp[:300])}")
 
+    expanded = ""
+    keywords: List[str] = []
+
+    # 1) 가장 먼저, 전체를 JSON으로 시도
     try:
-        # JSON 배열 패턴만 추출하여 파싱
-        match = re.search(r"\[.*?\]", resp, re.S)
-        if match:
-            return json.loads(match.group(0))[:10]
-    except Exception:
-        # JSON 파싱 실패 시 조용히 Fallback으로 전환
-        pass
+        data = json.loads(resp)
+    except json.JSONDecodeError:
+        # 2) 그 다음, { ... } 부분만 잘라서 다시 시도 (최소 관용 파서)
+        m = re.search(r"\{.*\}", resp, re.S)
+        if not m:
+            logger.warning(f"[EXPAND] JSON parse failed: no JSON object in resp={resp[:200]!r}")
+            data = None
+        else:
+            try:
+                data = json.loads(m.group(0))
+            except Exception as e:
+                logger.warning(f"[EXPAND] JSON parse failed(2): {e!r}, resp={resp[:200]!r}")
+                data = None
 
-    # Fallback: 쉼표/줄바꿈 등으로 쪼개서 영문 키워드 후보 생성
-    parts = re.split(r"[,;\n]", resp)
-    kws = [re.sub(r"[^A-Za-z0-9\s\-]", "", p).strip() for p in parts]
-    # 너무 짧거나 긴 토큰은 제외
-    return [k for k in kws if 2 <= len(k) <= 40][:10]
+    if isinstance(data, dict):
+        ks = data.get("keywords") or []
+        if not isinstance(ks, list):
+            ks = [ks]
+        for k in ks:
+            s = str(k).strip()
+            if not s:
+                continue
+            if len(s) > 40:
+                continue
+            keywords.append(s)
+
+    # 3) JSON 이 완전히 깨졌다면, 최소 fallback:
+    expanded = core_query or query
+    if not keywords:
+        keywords = [core_query or query]
+
+    # 중복 제거 + 순서 유지
+    keywords = dedup_keep_order(keywords)
+
+    logger.info(f"[EXPAND] expanded_query={expanded!r}")
+    logger.info(f"[EXPAND] keywords={keywords}")
+
+    return expanded, keywords
+
 
 def dedup_keep_order(xs: List[Any]) -> List[Any]:
     """
@@ -135,30 +218,64 @@ def dedup_keep_order(xs: List[Any]) -> List[Any]:
             out.append(x)
     return out
 
-def expand_query_kor(query: str) -> Tuple[str, List[str]]:
+
+def expand_query_kor(query: str, model_name: str = DEFAULT_MODEL_NAME) -> Tuple[str, List[str]]:
     """
-    한글 사용자 질의를 받아:
-      1) LLM으로부터 영문 키워드 리스트를 받고
-      2) 원 질의(query)를 포함해 dedup 후
-      3) '확장 질의 문자열(expanded_query)'와 '키워드 리스트'를 반환.
+    - 질의를 normalize(검색 꼬리 제거)한 후,
+    - LLM 기반 확장 쿼리 + 키워드 리스트를 생성하고,
+    - all_terms 에는 키워드 + 한글 정규화 질의 + 원 질의를 모두 포함.
 
-    - expanded_query: "kw1 kw2 ... kwN {원질문}" 형식의 하나의 긴 문자열
-    - keywords: LLM 키워드 + 원질문까지 포함된 리스트
+    반환:
+      expanded_query: dense 임베딩용 확장 문자열 (주로 영어 한 줄)
+      all_terms:     키워드 + 정규화 질의 + 원 질의 리스트
     """
-    # 1) LLM이 반환한 영문 키워드들
-    terms = dynamic_expand_query_llm(query)
+    core_q = normalize_query_for_expand(query)
+    expanded, kws = dynamic_expand_query_llm(query, model_name=model_name)
 
-    # 2) LLM 키워드 + 원문 질의를 순서 유지 + 중복 제거
-    all_terms = dedup_keep_order(terms + [query])
+    # all_terms 는 키워드 + 한글 질의까지 포함해서 lexical / fuzzy에 사용
+    all_terms = dedup_keep_order(kws + ([core_q] if core_q else []) + [query])
 
-    # 3) dense 검색용 확장 텍스트
-    expanded_query = " ".join(all_terms)
-    print(expanded_query)
-    return expanded_query, all_terms
+    logger.info(f"[EXPAND] expanded_query (head)={expanded[:200]!r}")
+    logger.info(f"[EXPAND] keywords(all_terms)={all_terms}")
+
+    return expanded, all_terms
+
+
+
+# ============================================
+# 3. 하이브리드 검색 (dense + lexical)
+# ============================================
+
+def build_lexical_filter_any(keywords: List[str]) -> Optional[Filter]:
+    """
+    키워드 리스트를 받아서,
+    '_node_text' 필드에 대해 '키워드 중 하나라도 매칭되면 OK'인 Filter 생성.
+
+    Qdrant 쿼리 의미:
+      should = [ MatchText(kw1), MatchText(kw2), ... ]
+      → kw1 OR kw2 OR ...
+    """
+    kw_clean = [k.strip() for k in keywords if isinstance(k, str) and k.strip()]
+    if not kw_clean:
+        return None
+
+    # 너무 많은 키워드는 성능/노이즈 때문에 잘라주는 것도 옵션 (예: 상위 8개만)
+    MAX_LEXICAL_KEYWORDS = 8
+    kw_clean = kw_clean[:MAX_LEXICAL_KEYWORDS]
+
+    conds = [
+        FieldCondition(
+            key="_node_text",
+            match=MatchText(text=kw),
+        )
+        for kw in kw_clean
+    ]
+
+    return Filter(should=conds)
 
 def dense_retrieve_hybrid(
         client: QdrantClient,
-        emb,
+        emb: Any,
         expanded_text: str,
         keywords: List[str],
         collection_name: str,
@@ -187,6 +304,11 @@ def dense_retrieve_hybrid(
     """
     # 0) 질의 텍스트 정리 (None 방어 + 공백 trim)
     text_for_query = (expanded_text or "").strip()
+    logger.info(
+        f"[HYBRID] collection={collection_name}, "
+        f"text_for_query_len={len(text_for_query)}, "
+        f"#keywords={len(keywords)}"
+    )
 
     # ------------------------
     # 1) dense vector 검색
@@ -214,36 +336,30 @@ def dense_retrieve_hybrid(
             timeout=3,
         ).points
     except Exception as e:
-        logger.warning(f"[dense_retrieve_hybrid] dense search failed: {e}")
+        logger.warning(f"[HYBRID] dense search failed: {e}")
         dense_hits = []
     t3 = time.time()
 
     if timings is not None:
         timings["qdrant_dense"] = t3 - t2
 
+    logger.info(f"[HYBRID] dense_hits={len(dense_hits)}")
+
     # ------------------------
     # 2) 키워드 기반 lexical 검색
     # ------------------------
     lexical_hits = []
     if keywords:
-        # 키워드들을 하나의 문장으로 합쳐 full-text match에 사용
-        text_for_lexical = " ".join([k for k in keywords if k]).strip()
-        if text_for_lexical:
+        flt = build_lexical_filter_any(keywords)
+        logger.debug(f"[HYBRID] lexical keywords={keywords!r}, filter={flt!r}")
+
+        if flt is not None:
             try:
-                # _node_text 필드를 대상으로 MatchText 수행
-                flt = Filter(
-                    must=[
-                        FieldCondition(
-                            key="_node_text",
-                            match=MatchText(text=text_for_lexical),
-                        )
-                    ]
-                )
                 t4 = time.time()
                 lexical_hits = client.query_points(
                     collection_name=collection_name,
-                    query=None,   # 순수 텍스트 필터 기반 검색
-                    filter=flt,
+                    query=None,              # 쿼리 벡터 없음 → 필터 기반 full-text
+                    query_filter=flt,
                     limit=TOP_K_BASE,
                     with_payload=True,
                     timeout=3,
@@ -252,8 +368,15 @@ def dense_retrieve_hybrid(
                 if timings is not None:
                     timings["qdrant_lexical"] = t5 - t4
             except Exception as e:
-                logger.warning(f"[dense_retrieve_hybrid] lexical search failed: {e}")
+                logger.warning(f"[HYBRID] lexical search failed: {e}")
                 lexical_hits = []
+        else:
+            logger.info("[HYBRID] lexical filter is None (no valid keywords)")
+
+    logger.info(
+        f"[HYBRID] lexical_hits={len(lexical_hits)}, "
+        f"dense_hits={len(dense_hits)}"
+    )
 
     # ------------------------
     # 3) dense + lexical 결과 병합
@@ -268,8 +391,17 @@ def dense_retrieve_hybrid(
             merged[h.id] = h
 
     hits = list(merged.values())
+    logger.info(
+        f"[HYBRID] merged_hits={len(hits)} "
+        f"(dense={len(dense_hits)}, lexical={len(lexical_hits)})"
+    )
+
     return hits
 
+
+# ============================================
+# 4. 키워드 부스트 + RRF 리랭킹
+# ============================================
 
 def _keyword_score_for_hit(payload: Dict[str, Any], keywords: List[str]) -> float:
     """
@@ -281,7 +413,7 @@ def _keyword_score_for_hit(payload: Dict[str, Any], keywords: List[str]) -> floa
     """
     body, title = _payload_texts(payload)
 
-    #  Fuzzy matching 전에 텍스트 길이를 제한해 속도 확보(최적화용)
+    # Fuzzy matching 전에 텍스트 길이를 제한해 속도 확보(최적화용)
     body = clamp_text(body, max_chars=4096)
 
     if not body and not title:
@@ -339,8 +471,24 @@ def rrf_rerank(hits, keywords: List[str], k: int = 60):
 
     # 스코어 내림차순 정렬
     sorted_ids = sorted(scored.keys(), key=lambda x: scored[x], reverse=True)
-    return [id2hit[iD] for iD in sorted_ids]
+    reranked = [id2hit[iD] for iD in sorted_ids]
 
+    # 상위 몇 개 결과는 디버깅 로그로 남김
+    top_dbg = []
+    for h in reranked[:3]:
+        top_dbg.append(
+            f"id={h.id}, vec={getattr(h, 'score', None)}, "
+            f"boost={boost_map.get(h.id, 0.0):.3f}, "
+            f"title={repr((_payload_texts(h.payload or {})[1]))[:80]}"
+        )
+    logger.info(f"[RRF] top3 after rerank:\n  " + "\n  ".join(top_dbg))
+
+    return reranked
+
+
+# ============================================
+# 5. 컨텍스트 빌드
+# ============================================
 
 def build_context(hits):
     """
@@ -369,9 +517,8 @@ def build_context(hits):
         body = clamp_text(body, SNIPPET_MAX_CHARS)
 
         # 상위 몇 개는 raw 텍스트를 로그로 남겨 디버깅에 활용
-        if i <= 3:
+        if i <= TOP_K_RETURN:
             logger.info(f"[DEBUG] RAW_TITLE[{i}]: {repr(title)}")
-            logger.info(f"[DEBUG] RAW_BODY[{i}]: {repr(body)}")
 
         items.append(f"[{i}] {title}\n{body}")
         refs.append(f"[{i}] {title}")
@@ -379,5 +526,6 @@ def build_context(hits):
         if len(items) >= TOP_K_RETURN:
             break
 
+    logger.info(f"[CTX] built context items={len(items)}, unique_docs={len(seen_ids)}")
     # LLM에 넘길 컨텍스트는 큰 문자열 하나로 합침
     return "\n\n".join(items), refs

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import logging, nest_asyncio, time, traceback
+import logging, time, traceback
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -10,7 +10,7 @@ from rag_pipeline import decide_rag_needed, run_rag_ab_compare
 from rag_store import build_rag_objects_dual
 from retrieval import expand_query_kor, dense_retrieve_hybrid, rrf_rerank, build_context
 from settings import COLLECTION, COLLECTION_B, TRITON_URL
-from triton_client import triton_infer, get_tokenizer_for_model, ensure_single_model_loaded, unload_model_safe, \
+from triton_client import triton_infer, get_tokenizer_for_model, \
     get_triton_client
 
 # ---------------------------
@@ -18,7 +18,7 @@ from triton_client import triton_infer, get_tokenizer_for_model, ensure_single_m
 # ---------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
-logger = logging.getLogger("uvicorn")
+logger = logging.getLogger("RAG_Pipeline")
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -53,7 +53,6 @@ async def triton_stream_async(model_name: str, prompt: str):
     loop = asyncio.get_event_loop()
     gen = triton_infer(model_name, prompt, stream=True)
 
-    i = 0
     while True:
         chunk = await loop.run_in_executor(None, next, gen, None)
         if chunk is None:
@@ -61,8 +60,6 @@ async def triton_stream_async(model_name: str, prompt: str):
             break
 
         text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="ignore")
-
-        i += 1
 
         yield text
 
@@ -86,9 +83,7 @@ async def query_stream(question: str, model: str = "gpt"):
     이런 식으로 호출 (HTML에서 select 박스로 model 값을 넘김)
 
     1) model 키 → Triton 모델 이름 변환
-    2) ensure_single_model_loaded(model_name) 호출
-    3) RAG / Chat 프롬프트 생성 + triton_stream_async(model_name, ...)
-    4) 끝나면 finally에서 unload_model_safe(model_name)
+    2) RAG / Chat 프롬프트 생성 + triton_stream_async(model_name, ...)
     """
 
     model_key = model.lower()
@@ -108,13 +103,10 @@ async def query_stream(question: str, model: str = "gpt"):
 
             # 1: 게이트 (RAG / Chat 판단)
             t0 = time.time()
-            need_rag = decide_rag_needed(question, model_name=model_name)
+            need_rag = decide_rag_needed(question)
             t1 = time.time()
             yield f"data: [STEP 1] 게이트={need_rag} (t={t1 - t0:.2f}s)\n\n"
 
-            # 질의 확장은 한 번만
-            expanded_text = None
-            kw_list = None
 
             # RAG 결과 컨텍스트
             context_a = ""
@@ -154,7 +146,7 @@ async def query_stream(question: str, model: str = "gpt"):
                     f"컨텍스트(ctx)={ta.get('build_context', 0.0):.3f}s\n\n"
                 )
                 yield (
-                    "data: [PERF-A] "
+                    "data: [PERF-B] "
                     f"확장(expand)={tb.get('expand_query', 0.0):.3f}s, "
                     f"검색(dense_total)={tb.get('dense_search', 0.0):.3f}s, "
                     f"리랭크(rerank)={tb.get('rerank', 0.0):.3f}s, "
@@ -243,15 +235,9 @@ async def query_stream(question: str, model: str = "gpt"):
 
 답변 형식 가이드라인:
 1. 첫 문단에 2~3문장으로 전체 내용을 한국어로 요약합니다.
-2. 그 다음에는 "1. 소제목" 형식의 번호 매기기 목록으로 핵심 내용을 정리합니다.
-   - 소제목은 컨텍스트 내용을 압축해 한국어로 알기 쉽게 지어주세요.
-   - 각 항목은 "1. 소제목 [1][3]"처럼 관련 출처 번호를 대괄호로 표기합니다.
-   - 소제목 아래 줄에서 2~4문장 정도로 내용을 설명합니다.
+2. 여러 논문을 묶어 공통된 연구 방향/주제를 중심으로 정리하세요.
 3. 문장 중간에 근거를 달 때는 "…라는 점이 보고되었습니다[1][3]."처럼 [1] 형태의 인용 번호를 사용합니다.
-4. 한국어 문장 사이에는 일반적인 띄어쓰기를 사용하고,
-   '의학기술의최신동향은'처럼 모든 단어를 붙여 쓰지 말고
-   '의학 기술의 최신 동향은'처럼 자연스러운 띄어쓰기를 사용하세요.
-5. 마지막에는 아래 예시처럼 참고문헌 섹션을 추가합니다.
+4. 마지막에는 아래 예시처럼 참고문헌 섹션을 추가합니다.
 
 참고문헌:
 [1] 논문 제목A
@@ -264,6 +250,7 @@ async def query_stream(question: str, model: str = "gpt"):
                         {"role": "system", "content": sys_msg_a},
                         {"role": "user", "content": user_msg_a},
                     ]
+                    logger.info(f"[DEBUG] Prompt A []: {messages_a}")
                     prompt_a = tok.apply_chat_template(
                         messages_a, tokenize=False, add_generation_prompt=True
                     )
@@ -294,7 +281,7 @@ async def query_stream(question: str, model: str = "gpt"):
                     "이 응답은 [B 스택] 검색 결과를 기반으로 합니다."
                 )
                 user_msg_b = f"""
-다음은 [A 스택]에서 검색한 관련 문서 발췌입니다. 각 문단 앞의 번호는 출처 번호입니다.
+다음은 [B 스택]에서 검색한 관련 문서 발췌입니다. 각 문단 앞의 번호는 출처 번호입니다.
 
 [컨텍스트 발췌 시작]
 {context_b}
@@ -315,15 +302,9 @@ async def query_stream(question: str, model: str = "gpt"):
 
 답변 형식 가이드라인:
 1. 첫 문단에 2~3문장으로 전체 내용을 한국어로 요약합니다.
-2. 그 다음에는 "1. 소제목" 형식의 번호 매기기 목록으로 핵심 내용을 정리합니다.
-   - 소제목은 컨텍스트 내용을 압축해 한국어로 알기 쉽게 지어주세요.
-   - 각 항목은 "1. 소제목 [1][3]"처럼 관련 출처 번호를 대괄호로 표기합니다.
-   - 소제목 아래 줄에서 2~4문장 정도로 내용을 설명합니다.
+2. 여러 논문을 묶어 공통된 연구 방향/주제를 중심으로 정리하세요.
 3. 문장 중간에 근거를 달 때는 "…라는 점이 보고되었습니다[1][3]."처럼 [1] 형태의 인용 번호를 사용합니다.
-4. 한국어 문장 사이에는 일반적인 띄어쓰기를 사용하고,
-   '의학기술의최신동향은'처럼 모든 단어를 붙여 쓰지 말고
-   '의학 기술의 최신 동향은'처럼 자연스러운 띄어쓰기를 사용하세요.
-5. 마지막에는 아래 예시처럼 참고문헌 섹션을 추가합니다.
+4. 마지막에는 아래 예시처럼 참고문헌 섹션을 추가합니다.
 
 참고문헌:
 [1] 논문 제목A
@@ -336,6 +317,7 @@ async def query_stream(question: str, model: str = "gpt"):
                         {"role": "system", "content": sys_msg_b},
                         {"role": "user", "content": user_msg_b},
                     ]
+                    logger.info(f"[DEBUG] Prompt B []: {messages_b}")
                     prompt_b = tok.apply_chat_template(
                         messages_b, tokenize=False, add_generation_prompt=True
                     )
@@ -360,14 +342,6 @@ async def query_stream(question: str, model: str = "gpt"):
             traceback.print_exc()
             yield f"data: ⚠️ 오류: {err}\n\n"
             yield "data: [END]\n\n"
-
-        finally:
-            # 이 요청에서 사용한 모델은 무조건 내려준다 (한 번에 하나 전략)
-            try:
-                logger.info(f"[TRITON] unload_model_safe({model_name})")
-                unload_model_safe(model_name)
-            except Exception as e:
-                logger.warning(f"[TRITON] unload_model_safe({model_name}) failed: {e}")
 
     return StreamingResponse(
         event_gen(),

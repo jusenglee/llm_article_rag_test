@@ -23,7 +23,7 @@ EMBED_MODEL_B  = os.getenv("EMBEDDING_MODEL_B", "intfloat/multilingual-e5-large"
 
 # Triton
 TRITON_URL         = os.getenv("TRITON_URL", "211.241.177.73:8001")
-DEFAULT_MODEL_NAME = os.getenv("TRITON_MODEL", "gpt_oss_0")
+DEFAULT_MODEL_NAME = os.getenv("TRITON_MODEL", "gemma_vllm_0")
 TOKENIZER_MAP = {
     "gpt_oss_0": "openai/gpt-oss-20b",
     "gemma_vllm_0": "./data/gemma_vllm_0",
@@ -31,9 +31,9 @@ TOKENIZER_MAP = {
 
 # 하이퍼파라미터
 TOP_K_BASE       = 50
-TOP_K_RETURN     = 20
+TOP_K_RETURN     = 10
 MAX_TOKENS       = 8192
-TEMPERATURE      = 0.6
+TEMPERATURE      = 0.0
 TOP_P            = 0.9
 SCORE_THRESHOLD  = 0.15
 FUZZ_MIN         = 40
