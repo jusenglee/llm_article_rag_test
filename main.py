@@ -124,7 +124,6 @@ async def query_stream(question: str, model: str = "gpt"):
                 # 여기서 전체 RAG A/B 비교 한 번에 수행
                 res_map = run_rag_ab_compare(
                     query=question,
-                    with_llm=False,          # 여기서는 컨텍스트까지만, LLM은 아래에서 스트리밍
                     model_name=model_name,
                 )
                 res_a = res_map["A"]
